@@ -1,0 +1,42 @@
+### --------------------------------- ###
+### ----- Connecting to SPARTAN ----- ###
+### --- Log in with secure shell: --- ###
+### --------------------------------- ###
+
+ssh tewilkins@spartan.hpc.unimelb.edu.au
+spartan-weather
+
+### ---------------------------------------------------------- ###
+### ----- Getting data to and from the SPARTAN directory ----- ###
+### ----- This is done from the user's terminal - not SPARTAN. ###
+### ---------------------------------------------------------- ###
+
+### ----- Push whole directory - easier and safer ----- ###
+### ---------- inefficient with large files ----------- ###
+
+scp -r /Users/tewilkins/git/mw_metabarcoding_model/ tewilkins@spartan.hpc.unimelb.edu.au:/data/gpfs/projects/punim2381/
+
+### ----- Pull whole directory - best done on water-prod ----- ###
+
+
+
+
+### -------------------------------------- ###
+### ------ Running a job in SPARTAN ------ ###
+### -- Set working directory to project: - ###
+### -------------------------------------- ###
+
+cd /data/projects/punim2381/mw_metabarcoding_model/
+
+### ----- Run batch file: ----- ###
+
+sbatch 132-site_model_objects/132site.sbatch
+
+### ----- Check all jobs: ----- ###
+
+squeue --user=tewilkins
+
+### ----- Cancel a job ----- ###
+
+scancel [job_id]
+scancel 842736

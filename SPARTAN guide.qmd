@@ -1,0 +1,58 @@
+---
+title: "Running hierarchical multitaxon models through SPARTAN"
+author: "Thomas Wilkins"
+format: html
+editor: visual
+---
+
+## 1. Introduction
+
+This document provides a brief overview of how to set up and run hierarchical multi-taxon models in rstan using SPARTAN.
+RStan is the R interface to the Stan probabilistic programming language, which is used for Bayesian statistical modeling.
+SPARTAN is a high-performance cluster computing platform that allows users to run computationally intensive tasks.
+
+The ARC metabarcoding dataset contains 225 sites and a huge number of species.
+The hierarchical multi-taxon model allows us to model the occurrence of multiple taxa simultaneously while accounting for shared environmental drivers and random effects, but is incredibly computationally intensive to run.
+By leveraging SPARTAN's computational resources, we can efficiently run these models and obtain results in a reasonable timeframe.
+This is especially salient to the task of model selection, where multiple models need to be run and compared.
+
+### 1.1. New users
+
+Refer to the [SPARTAN User Guide](https://dashboard.hpc.unimelb.edu.au/started/) for detailed instructions on how to set up a new account, access the cluster, and submit jobs.
+
+New users:
+
+-   Log into Karaage
+
+-   Click Apply for account
+
+-   Enter your University of Melbourne email address and click Go
+
+-   You will receive an email with a link to proceed with the next step
+
+-   Once you click on the emailed link, click Next Log in with your AAF Identity.
+    For University of Melbourne staff/students, select "unimelb" and click Login
+
+-   Once logged in, on the Applicant screen, provide your position at the Uni (e.g. Masters student, PhD Student, Postdoc, Lecturer), your supervisors name, and your correct department (e.g. Physics, Mechanical Engineering)
+
+To request creation of a new project:
+
+-   Select "Apply to start a new project".
+    Please provide an appropriate title
+
+-   In the Description section:
+
+-   For Masters or PhD students, please provide your thesis abstract summary.
+
+-   For Postdocs/Lecturers, please provide a detailed research based project description - i.e. research being done, tools being used (i.e. software), people working on the project, estimated length of project.
+
+### 1.2. Connect to SPARTAN
+
+Connect to SPARTAN via SSH using a terminal application (e.g., Terminal on macOS/Linux or PuTTY on Windows).
+Enter login credentials provided during account setup, for example (replacing 'tewilkins' with your own user name):
+
+`ssh tewilkins@spartan.hpc.unimelb.edu.au`
+
+```{r}
+
+```
