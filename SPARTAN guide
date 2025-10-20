@@ -18,7 +18,16 @@ scp -r /Users/tewilkins/git/mw_metabarcoding_model/ tewilkins@spartan.hpc.unimel
 
 ### ----- Pull whole directory - best done on water-prod ----- ###
 
+# water-prod
+scp -r "tewilkins@spartan.hpc.unimelb.edu.au:/data/gpfs/projects/punim2381/mw_metabarcoding_model/132-site_model_objects/" "/home/student.unimelb.edu.au/tewilkins/uomShare/wergStaff/tewilkins/git-data/mw_metabarcoding_model/hpc_pull/"
 
+
+### ----- Removing files on SPARTAN ----- ###
+
+rm -r /data/gpfs/projects/punim2381/mw_metabarcoding_model
+
+# slurm files only:
+rm -r /data/gpfs/projects/punim2381/mw_metabarcoding_model/*.out
 
 
 ### -------------------------------------- ###

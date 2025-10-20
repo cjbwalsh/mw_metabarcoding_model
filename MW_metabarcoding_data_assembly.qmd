@@ -1,0 +1,413 @@
+---
+title: "Model data assembly for the 225-site dataset"
+author: "Thomas Wilkins"
+format: html
+editor: visual
+bibliography: references.bib
+---
+
+```{r}
+#| label: setup
+#| echo: false
+
+# source("https://tools.thewerg.unimelb.edu.au/data/mwstr_v13/mwstr_network_functions.R")
+source("https://raw.githubusercontent.com/tewilkins/mwbugs_functions/refs/heads/main/mwbugs_functions.R")
+
+requiredPackages <- c("WriteXLS", "rio", "rstan", "tidyverse", "geosphere")
+load_packages(requiredPackages) # Installs packages if not installed already
+
+# Create a folder to hold temporary data if not already present
+system(command = "mkdir -p temp_data/")
+
+```
+
+## 1. Introduction
+
+This document contains the assembly of environmental and biological data for the analysis of the 2021-23 macroinvertebrate DNA metabarcoding dataset, prepared for the A.
+The data is intended for modelling the presence/absences of stream macroinvertebrates with the Stan model `multitaxon_pa_rSAC.stan`, which is readily scalable to larger datasets.
+The model takes the following declarations as inputs:
+
+-   n_obs: number of observations (sample pairs)
+-   n_taxa: number of taxa (species)
+-   n_pred: number of predictor variables in the model (will depend on model selection)
+-   n_site: number of unique sites (225)
+-   n_seasons: number of seasons (2, Autumn and Spring)
+
+And the following derived data as inputs:
+
+-   y: a matrix of presence-absence data for each taxon and observation (n_obs x n_taxa)
+-   u: a matrix of predictor data at each observation (n_obs x n_pred)
+-   s: a matrix of subsample proportions for each observation (n_obs x n_taxa)
+-   M: a matrix of haversine distances between each pair of sites (n_site x n_site)
+-   site: a vector of site indices (numbered 1 to n_site) for each observation (n_obs)
+-   season: a vector of season indices (1 if Autumn, 2 if Spring) for each observation (n_obs)
+
+### 1.1. Retrieving sample pair and site data from Melbourne Water databases
+
+The location and environmental variables associated with the 225 sites was recorded in the Melbourne Water macroinvertebrate database [@walsh2020].
+Environmental data associated with each site was retrieved from the Melbourne Water stream database [@walsh].
+The following code chunk retrieves this data from the relevant database tables:
+
+```{r}
+#| label: data_retrieval
+#| echo: true
+#| message: false
+#| warning: false
+#| results: "hide"
+#| eval: false
+
+# Open terminal (not in RStudio tab), run:
+# ssh -L 5432:localhost:5432 -C -N -l  tewilkins 172.26.150.60
+
+# Connect to MW databases:
+mwbugs <- DBI::dbConnect(RPostgres::Postgres(), dbname = "mwbugs",
+                          host = "localhost", user = "readonly", password = "reachcode_42")
+mwstr <- DBI::dbConnect(RPostgres::Postgres(),dbname = "mwstr",
+                          host = "localhost", user = "readonly", password = "reachcode_42")
+
+# Retrieve sample pair data
+
+####  
+# Project 3:  Metabarcoded combined-RBA-sample-pair survey of 225 sites across
+#   Melbourne 2021-2024 (Nickname MW metabarcoding survey)
+
+samples <- DBI::dbGetQuery(mwbugs, 
+                          "SELECT * FROM samples 
+                           JOIN sample_project_groups
+                           ON samples.smpcode = sample_project_groups.smpcode
+                           WHERE sample_project_groups.project_code = 3;")
+# returns 275 samples from 225 sites (some sites have 2 samples, one in Autumn and one in Spring)
+
+biota <- DBI::dbGetQuery(mwbugs, 
+                           "SELECT * FROM biota 
+                           JOIN sample_project_groups
+                           ON biota.smpcode = sample_project_groups.smpcode
+                           WHERE sample_project_groups.project_code = 3;")
+# returns 19429 rows of biota data from 275 samples
+
+# Check samples have biota:
+# Drop samples without invertebrate entries
+# nrow(samples[!samples$smpcode %in% unique(biota$smpcode),]) # 0 samples without biota
+
+# Only include samples which are part of the metabarcoding project
+samples <- samples[samples$processing_method == "two samples combined, homogenized, DNA-metabarcoded",]
+# returns 265 samples from 225 sites
+
+biota <- biota[biota$smpcode %in% samples$smpcode,] # Reduced from 19429 to 18560 rows
+sites <- sf::st_read(mwbugs, query = paste0("SELECT * FROM sites WHERE sitecode IN ('",
+                              paste(unique(samples$sitecode), collapse = "','"), "');"))
+
+### --- Site coordinates for distance matrix
+sites_wgs84 <- sf::st_transform(sites$geom, crs = 4326) # Transform geometry into WGS84
+sites_coord <- as.data.frame(sf::st_coordinates(sites_wgs84)) # Extract coordinates
+sites$coord_X <- sites_coord$X # Add X coordinates to sites
+sites$coord_Y <- sites_coord$Y # Add Y coordinates to sites
+
+### --- Sample metadata variables
+
+# Retrieve environmental data from mwstr database
+samples$season <- "A"; samples$season[lubridate::month(samples$date) > 6] <- "S" # Season
+# regex to identify Riffle habitat in collection_method
+samples$riffle <- 0; samples$riffle[grep("riffle", samples$collection_method)] <- 1 # Riffle habitat
+
+### --- Forest cover
+
+# AF calculated for sites rather than reaches and stored in mwbugs database
+sites_af <- DBI::dbReadTable(mwbugs, "sitecode_env")
+
+# Check sites are in sites_af:
+sites$sitecode_v12[which(!sites$sitecode_v12 %in% sites_af$sitecode_v12)]
+# Some sites are not matched:
+# "MUC_987b"  "BRL_728e"  "TNK_2042d" "UOZ_1497c" "SPL_263d"  "TY9_79e"   "WMR_82c"   "BLT_87a" 
+
+# Check if there are some sites on the same reach:
+sites_af$sitecode_v12[which(substr(sites_af$sitecode_v12,1,nchar(sites_af$sitecode_v12)-1) %in% 
+                              c("MUC_987", "BRL_728", "TNK_2042", "UOZ_1497", "SPL_263", "TY9_79", "WMR_82", "BLT_87"))]
+# "BRL_728g"  "MUC_987i"  "UOZ_1497h" "SPL_263b"  "TY9_79a"   "WMR_82d"   "BLT_87c" 
+
+# Correct these sitecodes in sites_af to match those on the same reach (if possible):
+sites_af$sitecode_v12_corr <- sites_af$sitecode_v12
+sites_af$sitecode_v12_corr[which(sites_af$sitecode_v12 %in% 
+                              c("BRL_728g",  "MUC_987i",  "UOZ_1497h", "SPL_263b",  "TY9_79a",   "WMR_82d",   "BLT_87c"))] <-
+  c("BRL_728e",  "MUC_987b",  "UOZ_1497c", "SPL_263d",  "TY9_79e",   "WMR_82c",   "BLT_87a")
+
+# Check all sites are now matched
+sites$sitecode_v12[which(!sites$sitecode_v12 %in% sites_af$sitecode_v12_corr)]
+# Still one unmatched: "TNK_2042d"
+# Remove for now
+sites <- sites[sites$sitecode_v12 != "TNK_2042d",]
+samples <- samples[samples$sitecode_v12 != "TNK_2042d",]
+biota <- biota[biota$smpcode %in% samples$smpcode,]
+
+# Join environmental data to sites
+# A major storm on 9 June 2021 caused much forest loss https://www.theguardian.com/australia-news/2021/jun/24/dandenong-ranges-power-outage-storm-debris-victoria-emergency-services-warning
+# therefore use af_2018 before this date and af_2022 after.
+samples$af <- sites_af$af_2022[match(samples$sitecode_v12, sites_af$sitecode_v12_corr)]
+samples$af[samples$date < "2021-06-10"] <- sites_af$af_2018[match(samples$sitecode_v12[samples$date < "2021-06-10"],
+                         sites_af$sitecode_v12)]
+
+### --- Impervious cover and other environmental variables
+
+# Other variables can be adequately estimated from reach values.
+cat_env <- DBI::dbGetQuery(mwstr,paste0("SELECT *, subcs.carea_km2 FROM cat_env ",
+                                         "JOIN subcs ON cat_env.site = subcs.site ",
+                                         "WHERE cat_env.reach IN ('",
+                                         paste(sites$reach_v12, collapse = "', '"), "');"))
+subc_env <- DBI::dbGetQuery(mwstr,paste0("SELECT * FROM subc_env WHERE reach IN ('",
+                                         paste(sites$reach_v12, collapse = "', '"), "');"))
+
+samples$reach_v12 <- sites$reach_v12[match(samples$sitecode, sites$sitecode)] # Add reach_v12 to samples
+samples$carea_km2 <- cat_env$carea_km2[match(samples$reach_v12, cat_env$reach)] # Catchment area
+samples$dor <- cat_env$dor_2010[match(samples$reach_v12,cat_env$reach)] # Degree of regulation
+samples$ei <- cat_env$ei_2022[match(samples$reach_v12,cat_env$reach)] # Effective imperviousness
+samples$ti <- cat_env$ti_2022[match(samples$reach_v12,cat_env$reach)] # Total imperviousness
+samples$tf <- cat_env$tf_2022[match(samples$reach_v12,cat_env$reach)] # Total forest
+samples$tf[samples$date < "2021-06-10"] <- 
+  cat_env$tf_2018[match(samples$reach_v12[samples$date < "2021-06-10"],
+                         cat_env$reach)] # Adjust for storm-related forest loss
+samples$meanq <- cat_env$meanq_mm[match(samples$reach_v12,cat_env$reach)] # Mean annual runoff
+samples$meant <- subc_env$meant_y30_2022[match(samples$reach_v12,subc_env$reach)] # Mean annual temperature
+samples$elev <- subc_env$elev_asl_m[match(samples$reach_v12,subc_env$reach)] # Elevation above sea level
+samples$sitecode <- as.factor(samples$sitecode)
+samples$siteno <- as.numeric(as.factor(samples$sitecode_v12))
+samples$coord_X <- sites$coord_X[match(samples$sitecode, sites$sitecode)]
+samples$coord_Y <- sites$coord_Y[match(samples$sitecode, sites$sitecode)]
+
+samples <- samples[order(samples$siteno, samples$monthcode),] # Order by site and season
+
+# Disconnect from databases
+DBI::dbDisconnect(mwbugs)
+DBI::dbDisconnect(mwstr)
+
+# Write to excel file:
+writexl::write_xlsx(list("samples" = samples,
+                         "biota" = biota,
+                         "sites" = sites),
+                   path = "temp_data/mw_metabarcoding_225site_model_data.xlsx")
+
+# To WERG drive:
+writexl::write_xlsx(list("samples" = samples,
+                          "biota" = biota,
+                          "sites" = sites),
+                    path = "~/uomShare/wergStaff/tewilkins/git-data/mw_metabarcoding_model/data/mw_metabarcoding_225site_model_data.xlsx")
+
+```
+
+## 2. Analysis in Stan
+
+### 2.1. Assembling model data for Stan
+
+The following code chunk assembles the model data for input to the Stan model `multitaxon_pa_rSAC.stan`.
+
+```{r}
+#| label: stan_data
+#| echo: true
+#| message: false
+#| warning: false
+#| results: "hide"
+
+# Load data from excel file
+data_list <- rio::import_list("temp_data/mw_metabarcoding_225site_model_data.xlsx")
+
+samples <- data_list$samples
+biota <- data_list$biota
+
+### Preparing predictor data
+
+# scale fixed predictor variables
+# keeping them as scaled objects for ease of back-transforming later
+I <- scale(log(samples$ei + 0.01))
+F <- scale(samples$af)
+Q <- scale(samples$meanq^0.5)
+Q2 <- scale(samples$meanq^0.5)^2
+C <- scale(log(samples$carea_km2))
+D <- scale(pmin(samples$dor, 1))
+T <- scale(samples$meant)
+nriff <- scale(samples$riffle)
+
+# Random effects
+site <- samples$siteno
+site_group <- samples$site_group
+season <- as.numeric(as.factor(samples$season)) # Autumn = 1, Spring = 2
+
+# Coordinates
+coords <- unique(samples[,c("siteno", "coord_X", "coord_Y")])
+coords_XY <- cbind(coords$coord_X, coords$coord_Y)
+distm_XY <- scale(distm(coords_XY), center = FALSE)
+
+### Biota presence/absence, count and subsample percentage data
+biota_ct <- with(biota, ct(smpcode, shortcode, count))
+biota_ct <- biota_ct[match(samples$smpcode,row.names(biota_ct)),] # ensure c and u rows are ordered the same way
+
+### Predictor matrix (u in the model)
+# Full predictor set: I, F, Q, C, D, T, nriff, Q2, IF, QF, IQ
+# Interactions: IF, QF, IQ (all first order interactions only
+# Quadratic: Q2 (for modal response of biota to runoff, Q)
+# Most plausible model did not include interactions, should remove:
+
+# --- Predictor matrix u for morph samples
+I_mod <- as.vector(I)[match(samples$smpcode,row.names(biota_ct))]
+F_mod <- as.vector(F)[match(samples$smpcode,row.names(biota_ct))]
+Q_mod <- as.vector(Q)[match(samples$smpcode,row.names(biota_ct))]
+Q2_mod <- as.vector(Q2)[match(samples$smpcode,row.names(biota_ct))]
+C_mod <- as.vector(C)[match(samples$smpcode,row.names(biota_ct))]
+D_mod <- as.vector(D)[match(samples$smpcode,row.names(biota_ct))]
+T_mod <- as.vector(T)[match(samples$smpcode,row.names(biota_ct))]
+nriff_mod <- as.vector(nriff)[match(samples$smpcode,row.names(biota_ct))]
+
+samples_u <- cbind(I = I_mod,                   # Effective imperviousness
+                   F = F_mod,                   # Attenuated Forest cover
+                   Q = Q_mod,                   # mean annual runoff
+                   C = C_mod,                   # catchment area
+                   D = D_mod,                   # Degree of regulation
+                   T = T_mod,                   # Temperature  
+                   nriff = nriff_mod,           # number of riffles at site
+                   Q2 = Q2_mod,                 # square of Q for modal response
+                   IF = I_mod * F_mod,          # Interaction betwen I and F
+                   FQ = F_mod * (Q_mod + Q2_mod),      # Interaction betwen Q and F
+                   IQ = I_mod * (Q_mod + Q2_mod))      # Interaction betwen I and Q            
+
+samples_u <- samples_u[match(samples$smpcode,row.names(biota_ct)),] # ensure c and u rows are ordered the same way
+samples_u <- samples_u[,c("I","F","Q","C","D","T","nriff","Q2")] # final predictor set doesn't include interactions
+# Final predictor set: I, F, Q, C, D, T, nriff, Q2
+
+### Assemble stan data:
+biota_225site_data <- list(n_obs = nrow(biota_ct),                 # no. samples
+                    n_pred = ncol(samples_u),                     # no. predictors
+                    n_taxa = ncol(biota_ct),                       # no. taxa
+                    n_site = as.integer(max(samples$siteno)),     # no. sites
+                    n_seasons = as.integer(max(season)),                # no. seasons included in the dataset
+                    u = as.matrix(samples_u),               # predictor model matrix
+                    y = as.matrix(biota_ct),
+                    site = site,                            # site number for each obs
+                    season = season,                        # sampling either in Autumn (1) or Spring (2)
+                    M = as.matrix(distm_XY))
+
+# Write standata file to WERG drive:
+saveRDS(biota_225site_data, file = "~/uomShare/wergStaff/tewilkins/git-data/mw_metabarcoding_model/data/225site_standata.rds")
+
+# Store files locally (e.g., for use on SPARTAN):
+saveRDS(biota_225site_data, file = "temp_data/225site_standata.rds")
+
+
+
+```
+
+### 2.2. Creating directories for model outputs
+
+Normally when running a Stan model, the model outputs are written to a directory on the WERG shared drive, as this drive has sufficient space to store large model outputs and is accessible from multiple computers.
+However, to run the model on a high-performance computing cluster (such as SPARTAN), it is much easier to set up a local directory, then push the entire local directory to SPARTAN, run the model, then pull the entire directory back to the local computer for analysis.
+
+The following code chunk creates directories for storing model outputs both on the WERG shared drive and locally.
+
+```{r}
+#| label: create_output_dirs
+#| echo: true
+#| message: false
+#| warning: false
+#| results: "hide"
+
+# Create directory for model outputs on WERG shared drive
+## Create local directory for each model set:
+system(command = "mkdir -p 225-site_model_objects/")
+system(command = "mkdir -p 225-site_model_objects/draws/")
+system(command = "mkdir -p 225-site_model_objects/diagnostics/")
+
+```
+
+SPARTAN operates by running batch scripts on a remote server.
+The batch scripts are run through slurm, a workload manager for Linux clusters.
+The following is an example slurm batch script that can be used to run the Stan model on SPARTAN (saved as `225site.sbatch`):
+
+```{r}
+#| label: create_sbatch_script
+#| echo: true
+#| message: false
+#| warning: false
+#| results: "hide"
+
+sbatch_contents <- "#!/bin/bash
+#SBATCH -p sapphire                     # Select partition (high CPU)
+#SBATCH --job-name=225_site             # Job name
+#SBATCH --ntasks=1                      # Number of tasks
+#SBATCH --cpus-per-task=4               # Number of CPU cores per task - 4 required for Stan sampler
+#SBATCH --mem=500000                    # Memory per node
+#SBATCH --time=24:00:00                 # Time limit
+
+# Load the R module
+module load foss/2022a R/4.2.2
+
+# Run the R script corresponding to the array job ID
+Rscript 225-site_model_objects/225site_model.R
+
+
+##DO NOT ADD/EDIT BEYOND THIS LINE##
+##Job monitor command to list the resource usage
+my-job-stats -a -n -s
+"
+
+# Write it to a file
+writeLines(sbatch_contents, "225-site_model_objects/225site.sbatch")
+
+```
+
+### 2.3. Stan model script
+
+The following is an example R script that can be used to run the Stan model on SPARTAN (saved as `225site_model.R`):
+
+```{r}
+#| label: create_stan_rscript 
+#| echo: true 
+#| message: false 
+#| warning: false 
+#| results: "hide"
+
+# load stan data
+
+# standata <- readRDS("~/uomShare/wergStaff/tewilkins/git-data/mw_metabarcoding_model/data/biota_225site_standata.rds")
+
+standata <- readRDS("temp_data/biota_225site_standata.rds") # local version
+
+# Stop code from accidentally running on local computer
+
+stop() # unblock on SPARTAN or water-prod
+
+library(StanHeaders, lib="~/R_libs/4.2.2") 
+library(rstan, lib="~/R_libs/4.2.2") 
+source("functions/rstan_functions.R")
+
+# --- Set project seed
+
+proj_seed <- 12345 
+set.seed(proj_seed)
+
+# --- Set cores and load stan model:
+
+# rstan_options(auto_write = TRUE)
+
+options(mc.cores = parallel::detectCores()) 
+print("Sampling Stan model...") 
+model_fit <- rstan::stan(file = "stancode/multitaxon_pa_rSAC_noSS.stan", 
+                         data = standata, 
+                         control = list(adapt_delta = 0.9), 
+                         seed = proj_seed, 
+                         chains = 4, 
+                         iter = 4000)
+
+print("Model finished sampling.") 
+# --- Save model outputs to WERG shared drive: 
+print("Saving model draws...") 
+draws <- rstan::extract(model_fit, permuted = TRUE) 
+saveRDS(draws, file = "225-site_model_objects/draws/draws.rds") 
+saveRDS(draws$y_pred, file = "225-site_model_objects/draws/y_pred.rds")
+saveRDS(draws$mu, file = "225-site_model_objects/draws/mu_draws.rds") print("Draws saved.")
+
+# --- Generate diagnostics report
+
+print("Generating diagnostics report...") 
+mon <- as.data.frame(monitor(model_fit, print = FALSE)) 
+write.csv(mon, file = "225-site_model_objects/diagnostics/mon.csv") 
+report <- convergence_report(model_fit, mon) 
+print_convergence_report(report)
+
+```
