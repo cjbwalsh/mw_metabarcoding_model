@@ -239,6 +239,11 @@ distm_XY <- scale(distm(coords_XY), center = FALSE)
 biota_ct <- with(biota, ct(smpcode, shortcode, count))
 biota_ct <- biota_ct[match(samples$smpcode,row.names(biota_ct)),] # ensure c and u rows are ordered the same way
 
+### Family-level biota presence/absence data
+biota$famcode <- speciesToFamily(biota$taxoncode, rm = FALSE)
+biota_fam_ct <- with(biota, ct(smpcode, famcode, count))
+biota_fam_ct[biota_fam_ct > 1] <- 1 # convert to presence-absence
+
 ### Predictor matrix (u in the model)
 # Full predictor set: I, F, Q, C, D, T, nriff, Q2, IF, QF, IQ
 # Interactions: IF, QF, IQ (all first order interactions only
@@ -279,6 +284,8 @@ biota_225site_data <- list(n_obs = nrow(biota_ct),                 # no. samples
                     n_seasons = as.integer(max(season)),                # no. seasons included in the dataset
                     u = as.matrix(samples_u),               # predictor model matrix
                     y = as.matrix(biota_ct),
+                    sp_biota = as.matrix(biota_ct),
+                    fam_biota = as.matrix(biota_fam_ct),
                     site = site,                            # site number for each obs
                     season = season,                        # sampling either in Autumn (1) or Spring (2)
                     M = as.matrix(distm_XY))
@@ -411,3 +418,8 @@ report <- convergence_report(model_fit, mon)
 print_convergence_report(report)
 
 ```
+
+### 2.4. Family-level model
+
+The following code chunk creates a family-level version of the 225-site dataset for input to the Stan model `multitaxon_pa_rSAC.stan`.
+The taxonomic resolution is reduced from species-level to family-level by summing the presence-absence data for all species within each family.

@@ -186,12 +186,12 @@ model {
 }
 generated quantities {
   // log-likelihood for model comparisons (unblock during model development).
-  // matrix[n_obs,n_taxa] log_lik; // Log-likelihood for each observation and taxon
-  // for (i in 1:n_obs){
-  //   for (j in 1:n_taxa){
-  //     log_lik[i,j] = bernoulli_logit_lpmf(y[i,j] | mu[i,j] + log(s[i,j]));
-  //   }
-  // }
+  matrix[n_obs,n_taxa] log_lik; // Log-likelihood for each observation and taxon
+  for (i in 1:n_obs){
+    for (j in 1:n_taxa){
+      log_lik[i,j] = bernoulli_logit_lpmf(y[i,j] | mu[i,j]);
+    }
+  }
   
   // Posterior-predictive distribution
   matrix[n_obs,n_taxa] y_pred; // Predicted occurrence for each observation and taxon
