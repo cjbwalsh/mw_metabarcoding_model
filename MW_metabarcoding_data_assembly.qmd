@@ -12,6 +12,9 @@ editor_options:
 #| label: setup
 #| echo: false
 
+proj_seed <- 12345 
+set.seed(proj_seed)
+
 source("https://tools.thewerg.unimelb.edu.au/mwstr/data/mwstr_network_functions.R")
 right <- function(x, n) {substr(x, nchar(x) - n + 1, nchar(x))}
 # source("https://raw.githubusercontent.com/tewilkins/mwbugs_functions/refs/heads/main/mwbugs_functions.R")
@@ -26,9 +29,32 @@ right <- function(x, n) {substr(x, nchar(x) - n + 1, nchar(x))}
 # Create a folder to hold temporary data if not already present
 system(command = "mkdir -p temp_data/")
 
+# pairs add-on function from pairs() help file
+panel.cor <- function(x, y, digits = 2, prefix = "", cex.cor, ...)
+{
+    par(usr = c(0, 1, 0, 1))
+    r <- abs(cor(x, y))
+    txt <- format(c(r, 0.123456789), digits = digits)[1]
+    txt <- paste0(prefix, txt)
+    if(missing(cex.cor)) cex.cor <- 0.8/strwidth(txt)
+    text(0.5, 0.5, txt, cex = cex.cor * r)
+}
+
+ct <- function (rows, cols, values = NULL, FUN = sum, convertNAToZero = TRUE,...) 
+{
+  if(!is.vector(rows)) rows <- as.vector(rows)
+  if(!is.vector(cols)) cols <- as.vector(cols)
+  if(is.null(values)) values <- rep(1,length(rows))
+  results <- tapply(values, list(rows, cols), FUN, ...)
+  if(convertNAToZero)
+    results[is.na(results)] <- 0
+  results
+}
+
+
 ```
 
-## 1. Introduction
+## Introduction
 
 This document contains the assembly of environmental and biological data for the analysis of the 2021-23 macroinvertebrate DNA metabarcoding dataset, prepared for the A. The data is intended for modelling the presence/absences of stream macroinvertebrates with the Stan model `multitaxon_pa_rSAC.stan`, which is readily scalable to larger datasets. The model takes the following declarations as inputs:
 
@@ -94,14 +120,16 @@ samples$sitecode_v12[grep("TOO",samples$sitecode_v12)] <- "TOO_4332c"
 # Check distribution of samples
 # x <- aggregate(samples$smpcode, by = list(sitecode = samples$sitecode_v12), FUN = length)
 # aggregate(x$sitecode, by = list(n_samps = x$x), FUN = length)
-# 202 sites sampled once; 13 sampled twice, 10 (from project 2) sampled 3-5 times.
+# 200 sites sampled once; 13 sampled twice, 10 (from project 2) sampled 4-5 times.
+
+#### Perhaps also worth considering removing LSN, with a lot of SCMs not accounted for in its EI measurement
 
 biota <- DBI::dbGetQuery(mwbugs, 
                            "SELECT * FROM biota 
                            JOIN sample_project_groups
                            ON biota.smpcode = sample_project_groups.smpcode
                            WHERE sample_project_groups.project_code = 3;")
-# returns 20691 records 
+# returns 20694 records 
 # NOTE project 3 includes the samples collected for project 2, which were fully
 # processed, with 8-11 replicate MiSeq samples. All species detected in those
 # samples are included in the biota table.  The samples can be adjusted to 
@@ -117,26 +145,22 @@ biota <- biota[!grepl("EXCLUDE this record from 3-rep",
 sites <- sf::st_read(mwbugs, query = 
                       paste0("SELECT * FROM sites WHERE sitecode_v12 IN ('",
                              paste(samples$sitecode_v12, collapse = "','"),"');"))
+sites$site_no
 # returns 223 sites (a spatial table, so sf:st_read() was used)
 
 ```
 
 ### 1.2. Between-site distance matrices
 
-We calculated three matrices of distances between sampling sites (Tom, I just calculated them - we can discuss which of them we use): 
+We calculated three matrices of distances between sampling sites: 
 
 - Euclidean distances, calculated from Map Grid of Australia 2020 Zone 55 coordinates. Tom, your previous reference to haversine distances, while strictly correct, is an unnecessarily complicated term for a small area such as the Melbourne region. crs 7855 (Map Grid of Australia 2020 Zone 55) is a planar projection applicable to our area, meaning that we can consider the earth (around here) flat.  So, we can just use 7855 coordinates (unit metres) to calculate Euclidean distances.  
 
 - upstream river distances, calculated as the along-stream distance from downstream to upstream for all pairs of sites on the same stream line, using the Melbourne Stream Network database stream lines.  
+
 - downstream river distances, calculated as for upstream river distances, but from upstream sites to downstream sites.
 
-Tom, we need to be explicit about what we want to model with these matrices. I am not taken by your argument (from your email):
-
-*I have doubts about how much the similarity between sites overland could be attributed to species-specific aerial dispersal - I think this would be better addressed with some sort of population genomics approach (see Razeng et al., 2017, attached), because, in my thinking, the overland distance doesn’t strictly imply connectivity between sites, just that there is some non-randomness in the spatial arrangement of sites that can be accounted for… though it would be nice to follow up on this with a smaller dataset.*  
-
-I'm not suggesting that we conduct a study of aerial dispersal, but we need to have some biological/ecological/environmental basis for predictors that are seeking to explain non-randomness. If we are seeking to explain a species' distribution, then spatial patterns of distribution have to be either a result of spatial patterns in environmental effects (which we aim to portray with our environmental variables) or movement of species between sites.  In my view, in a well-structured model, spatial autocorrelation should be modelling the latter (movement between sites).  In that case, autocorrelation along Euclidean lines between sites is most likely to be modelling aerial (or possibly overland) dispersal. I find it unsatisfactory to consider autocorrelation with euclidean distance to be just explaining some unspecified non-randomness.
-
-For stream macroinvertebrates, a second likely vector of movement is in-stream.  Generally, downstream movement is considered the dominant vector of dispersal, but up-stream movement is also possible. I have calculated both upstream and downstream matrices because it was easy to do, but if we were to use only one, it would be the upstream river distance matrix (dist_us_km_223), which models the likely effect of movement from upstream sites. (In dist_us_km_233, the most upstream sites have Inf distance from all other sites - i.e. no possible influence from upstream; conversely in dist_ds_km_233 the most downstream sites have Inf distance from all other sites - i.e. no possible influence from downstream...clear as mud?)
+We begin by modelling downstream river distances, as this is likely the most dominant pathway for movement between reaches.  We could potentially add the other two matrices at a later date.
 
 Now, 98.1% of all pairs of the 223 sites in the dataset have Inf distance in these two river distance matrices (unsurprising, as my intention in picking sites was to minimise the possibility of spatial autocorrelation among sites).  I feel like Inf is going to be problematic when you scale the distances....Given the maximum non-Inf value in the dataset is 188 km, I wonder if it would be defensible to just set the Inf values to something like 2 times 188 (or 3 times?), given that a priori, we would expect the influence of sites 188 km apart on each other to be zero... 
 
@@ -159,9 +183,21 @@ I also need to be convinced of the wisdom of calculating a distance matrix on sa
 
 # 1. Ecuclidean distance matrix
 sites$site_no <- 1:nrow(sites)
-sites_coords_km <- sf::st_drop_geometry(sites)[c("mgae_7855","mgan_7855")]/1000
+sites_coords_km <- sf::st_coordinates(sites)/1000
 dist_euc_km <- as.matrix(stats::dist(sites_coords_km, diag = TRUE, upper = TRUE))
-dist_euc_scaled <- scale(dist_euc_km, center = FALSE)
+# dist_euc_scaled <- scale(dist_euc_km, center = FALSE)
+# scale() scales by column, which is not what we want to do here.  
+# We need to vectorize, scale and return to matrix
+x <- as.vector(dist_euc_km)
+x <- scale(x, center = FALSE)
+dist_euc_scaled <- matrix(x, ncol = ncol(dist_euc_km))
+dist_euc_inv_w <- exp(-dist_euc_km)
+# set diagonal to zero as in original stan model
+for(i in 1:nrow(dist_euc_inv_w)){
+  dist_euc_inv_w[i,i] <- 0
+}
+# Inspect and assess need for scaling
+# range(dist_euc_inv_w)  0 to 1, no need for scaling
 
 # 2 and 3. The two river distance matrices (Not yet scaled: needs further consideration)
 
@@ -169,9 +205,9 @@ dist_euc_scaled <- scale(dist_euc_km, center = FALSE)
 sites$site <- sites$reach_length_m <- NA
 for(i in 1:nrow(sites)){
   site_stats <- DBI::dbGetQuery(mwstr, 
-      paste0("SELECT site, length_m FROM streams WHERE reach = '", 
-             sites$reach_v12[i], "';"))
-  sites$reach_length_m[i] <- site_stats$length_m
+                                paste0("SELECT site, length_m FROM streams WHERE reach = '", 
+                                       sites$reach_v12[i], "';"))
+  sites$reach_length_m[i] <- sum(site_stats$length_m) # some subcs have > 1 line in streams
   sites$site[i] <- site_stats$site
 } # takes 10 s
 
@@ -185,9 +221,10 @@ network_df <- igraph::as_long_data_frame(network_ig)
 
 # Subset the network object to link only the 223 sites of interest
 network_223 <- data.frame(vertex = match(sites$site, network_i[,1]),
+                          site_no = sites$site_no,
                           site = sites$site, 
                           sitecode = sites$sitecode_v12,
-                          nextds = NA, dist_km = NA)
+                          nextds = NA, nextds_no = NA, dist_km = NA)
 network_223 <- network_223[!duplicated(network_223$site),]
 
 for(i in 1:nrow(network_223)){
@@ -196,12 +233,13 @@ for(i in 1:nrow(network_223)){
   all_ds_223 <- as.numeric(names(all_ds_i)[names(all_ds_i) %in% network_223$site])
   # Next downstream site in pruned network is the second listed subcomponent 
   # (i.e. all downstream)
-  network_223$nextds[i] <- all_ds_223[2]
+  network_223$nextds[i] <- all_ds_223[2] #network_223$site_no[network_223$site == all_ds_223[2]]
   if(!is.na(network_223$nextds[i])){
   all_ds_nextds <- as.numeric(names(igraph::subcomponent(network_ig, 
                             all_ds_i[names(all_ds_i) == network_223$nextds[i]], 
                             mode = "out")))
-  reaches_bn <- setdiff(names(all_ds_i), all_ds_nextds)
+  # all reaches between the site and its nextds (including those two sites)
+  reaches_bn <- c(setdiff(names(all_ds_i), all_ds_nextds),network_223$nextds[i])
   ds_sitecode <- sites$sitecode_v12[sites$site == network_223$nextds[i]]
   # Length of all full reaches between the two sites
   network_223$dist_km[i] <- (sum(subcs$tot_length_m[subcs$site %in% reaches_bn]) - 
@@ -211,13 +249,16 @@ for(i in 1:nrow(network_223)){
     # minus the distance downstream of the site on the downstream reach
      (0.1* match(right(ds_sitecode,1),letters) - 0.05) * 
     sites$reach_length_m[sites$sitecode_v12 == ds_sitecode])/1000
+  network_223$nextds_no[i] <- 
+    network_223$site_no[network_223$site == all_ds_223[2]]
   }else{
     network_223$dist_km[i] <- Inf
   }
   } # takes ~10 s
 
 network_223$nextds[is.na(network_223$nextds)] <- -(sum(is.na(network_223$nextds)):1)
-network_223_i <- apply(network_223[,c("site","nextds")], 2, as.character)
+network_223$nextds_no[is.na(network_223$nextds_no)] <- -(sum(is.na(network_223$nextds_no)):1)
+network_223_i <- apply(network_223[,c("site_no","nextds_no")], 2, as.character)
 network_223_ig <- igraph::graph_from_data_frame(network_223_i)
 igraph::E(network_223_ig)$weight <- network_223$dist_km
 
@@ -227,6 +268,20 @@ dist_ds_km_223 <- igraph::distances(network_223_ig,
                                  weights = network_223$dist_km)
 # Remove the terminal sites 
 dist_ds_km_223 <- as.matrix(dist_ds_km_223)[1:223,1:223]
+# dist_ds_scaled <- dist_ds_km_223
+# dist_ds_scaled[dist_ds_scaled == Inf] <- 1000
+# # scale() scales by column, which is not what we want to do here.  
+# # We need to vectorize, scale and return to matrix
+# x <- as.vector(dist_ds_scaled)
+# x <- scale(x, center = FALSE)
+# dist_ds_scaled <- matrix(x, ncol = ncol(dist_ds_scaled))
+dist_ds_inv_w <- exp(-dist_ds_km_223)
+# set diagonal to zero as in original stan model
+for(i in 1:nrow(dist_ds_inv_w)){
+  dist_ds_inv_w[i,i] <- 0
+}
+# Inspect and assess need for scaling
+# range(dist_ds_inv_w) #  0 to 0.88 # no need for scaling
 
 # Downstream river distance matrix
 dist_us_km_223 <- igraph::distances(network_223_ig, 
@@ -234,75 +289,66 @@ dist_us_km_223 <- igraph::distances(network_223_ig,
                                  weights = network_223$dist_km)
 # Remove the terminal sites 
 dist_us_km_223 <- as.matrix(dist_us_km_223)[1:223,1:223]
+dist_us_inv_w <- exp(-dist_us_km_223)
+# set diagonal to zero as in original stan model
+for(i in 1:nrow(dist_us_inv_w)){
+  dist_us_inv_w[i,i] <- 0
+}
+# Inspect and assess need for scaling
+# range(dist_us_inv_w) #  0 to 0.88 # no need for scaling
 
 # sum(dist_ds_km_223 == Inf)/length(dist_ds_km_223) # 98.1% = Inf (i.e. independent)
 # sum(dist_us_km_223 == Inf)/length(dist_us_km_223) # same
 
 ```
 
-Tom, Chris has not yet got past this point...
-
-### 1.3. Compile environmental predictors
+### Compile environmental predictors
 
 ```{r}
 
 ### --- Sample metadata variables
 
+samples_db <- samples
+samples <- samples[c("smpcode","date","sitecode_v12")]
+samples$reach_v12 <- substr(samples$sitecode_v12,1,nchar(samples$sitecode_v12)-1)
+samples$site_no <- sites$site_no[match(samples$sitecode_v12, sites$sitecode_v12)]
 # Retrieve environmental data from mwstr database
-samples$season <- "A"; samples$season[lubridate::month(samples$date) > 6] <- "S" # Season
+samples$season <- 0; samples$season[lubridate::month(samples$date) > 6] <- 1 # Season - 0 = Autumn; 1 = Spring
 # regex to identify Riffle habitat in collection_method
-samples$riffle <- 0; samples$riffle[grep("riffle", samples$collection_method)] <- 1 # Riffle habitat
+samples$riffle <- 0; samples$riffle[grep("riffle", samples_db$collection_method)] <- 1 # Riffle habitat
 
 ### --- Forest cover
 
 # AF calculated for sites rather than reaches and stored in mwbugs database
-sites_af <- DBI::dbReadTable(mwbugs, "sitecode_env")
-
-# Check sites are in sites_af:
-sites$sitecode_v12[which(!sites$sitecode_v12 %in% sites_af$sitecode_v12)]
-# Some sites are not matched:
-# "MUC_987b"  "BRL_728e"  "TNK_2042d" "UOZ_1497c" "SPL_263d"  "TY9_79e"   "WMR_82c"   "BLT_87a" 
-
-# Check if there are some sites on the same reach:
-sites_af$sitecode_v12[which(substr(sites_af$sitecode_v12,1,nchar(sites_af$sitecode_v12)-1) %in% 
-                              c("MUC_987", "BRL_728", "TNK_2042", "UOZ_1497", "SPL_263", "TY9_79", "WMR_82", "BLT_87"))]
-# "BRL_728g"  "MUC_987i"  "UOZ_1497h" "SPL_263b"  "TY9_79a"   "WMR_82d"   "BLT_87c" 
-
-# Correct these sitecodes in sites_af to match those on the same reach (if possible):
-sites_af$sitecode_v12_corr <- sites_af$sitecode_v12
-sites_af$sitecode_v12_corr[which(sites_af$sitecode_v12 %in% 
-                              c("BRL_728g",  "MUC_987i",  "UOZ_1497h", "SPL_263b",  "TY9_79a",   "WMR_82d",   "BLT_87c"))] <-
-  c("BRL_728e",  "MUC_987b",  "UOZ_1497c", "SPL_263d",  "TY9_79e",   "WMR_82c",   "BLT_87a")
-
-# Check all sites are now matched
-sites$sitecode_v12[which(!sites$sitecode_v12 %in% sites_af$sitecode_v12_corr)]
-# Still one unmatched: "TNK_2042d"
-# Remove for now
-sites <- sites[sites$sitecode_v12 != "TNK_2042d",]
-samples <- samples[samples$sitecode_v12 != "TNK_2042d",]
-biota <- biota[biota$smpcode %in% samples$smpcode,]
+sites_af <- DBI::dbGetQuery(mwbugs, paste0("SELECT sitecode_v12, af_l5_w633_1750, ",
+                                           "af_l5_w633_2018, af_l5_w633_2022 ",
+                                           "FROM sitecode_env WHERE sitecode_v12 IN ('",
+                                           paste(sites$sitecode_v12, collapse = "', '"),"');"))
+# Check sites are in sites_af: sum(!sites$sitecode_v12 %in% sites_af$sitecode_v12)  # zero
+# sitecode_env table in database was cleaned up 16 May 2026 and all sitecodes match now.
 
 # Join environmental data to sites
 # A major storm on 9 June 2021 caused much forest loss https://www.theguardian.com/australia-news/2021/jun/24/dandenong-ranges-power-outage-storm-debris-victoria-emergency-services-warning
 # therefore use af_2018 before this date and af_2022 after.
-samples$af <- sites_af$af_2022[match(samples$sitecode_v12, sites_af$sitecode_v12_corr)]
-samples$af[samples$date < "2021-06-10"] <- sites_af$af_2018[match(samples$sitecode_v12[samples$date < "2021-06-10"],
+samples$af <- sites_af$af_l5_w633_2022[match(samples$sitecode_v12, sites_af$sitecode_v12)]
+samples$af[samples$date < "2021-06-10"] <- sites_af$af_l5_w633_2018[match(samples$sitecode_v12[samples$date < "2021-06-10"],
                          sites_af$sitecode_v12)]
+samples$af_ref <- sites_af$af_l5_w633_1750[match(samples$sitecode_v12, sites_af$sitecode_v12)] # reference state for AF
 
 ### --- Impervious cover and other environmental variables
 
 # Other variables can be adequately estimated from reach values.
-cat_env <- DBI::dbGetQuery(mwstr,paste0("SELECT *, subcs.carea_km2 FROM cat_env ",
+cat_env <- DBI::dbGetQuery(mwstr,paste0("SELECT subcs.reach, subcs.carea_km2, ei_l44_sw1942_2022, c_basalt, ", 
+                                         "ti_2022, tf_2018, tf_2022, c_granite, meanq_mm, dor_2010 FROM cat_env ",
                                          "JOIN subcs ON cat_env.site = subcs.site ",
                                          "WHERE cat_env.reach IN ('",
                                          paste(sites$reach_v12, collapse = "', '"), "');"))
-subc_env <- DBI::dbGetQuery(mwstr,paste0("SELECT * FROM subc_env WHERE reach IN ('",
+subc_env <- DBI::dbGetQuery(mwstr,paste0("SELECT reach, meant_y30_2022, elev_asl_m FROM subc_env WHERE reach IN ('",
                                          paste(sites$reach_v12, collapse = "', '"), "');"))
 
-samples$reach_v12 <- sites$reach_v12[match(samples$sitecode, sites$sitecode)] # Add reach_v12 to samples
 samples$carea_km2 <- cat_env$carea_km2[match(samples$reach_v12, cat_env$reach)] # Catchment area
 samples$dor <- cat_env$dor_2010[match(samples$reach_v12,cat_env$reach)] # Degree of regulation
-samples$ei <- cat_env$ei_2022[match(samples$reach_v12,cat_env$reach)] # Effective imperviousness
+samples$ei <- cat_env$ei_l44_sw1942_2022[match(samples$reach_v12,cat_env$reach)] # Effective imperviousness
 samples$ti <- cat_env$ti_2022[match(samples$reach_v12,cat_env$reach)] # Total imperviousness
 samples$tf <- cat_env$tf_2022[match(samples$reach_v12,cat_env$reach)] # Total forest
 samples$tf[samples$date < "2021-06-10"] <- 
@@ -311,30 +357,126 @@ samples$tf[samples$date < "2021-06-10"] <-
 samples$meanq <- cat_env$meanq_mm[match(samples$reach_v12,cat_env$reach)] # Mean annual runoff
 samples$meant <- subc_env$meant_y30_2022[match(samples$reach_v12,subc_env$reach)] # Mean annual temperature
 samples$elev <- subc_env$elev_asl_m[match(samples$reach_v12,subc_env$reach)] # Elevation above sea level
-samples$sitecode <- as.factor(samples$sitecode)
-samples$siteno <- as.numeric(as.factor(samples$sitecode_v12))
-samples$coord_X <- sites$mgae_7855[match(samples$sitecode, sites$sitecode)]
-samples$coord_Y <- sites$mgan_7855[match(samples$sitecode, sites$sitecode)]
+samples$coord_X <- sf::st_coordinates(sites[match(samples$sitecode_v12, sites$sitecode_v12),])[,1]
+samples$coord_Y <- sf::st_coordinates(sites[match(samples$sitecode_v12, sites$sitecode_v12),])[,2]
 
-samples <- samples[order(samples$siteno, samples$monthcode),] # Order by site and season
+samples <- samples[order(samples$site_no, samples$date),] # Order by site and season
+sites_for_xl <- sites
+sf::st_geometry(sites_for_xl) <- NULL
 
 # Disconnect from databases
 DBI::dbDisconnect(mwbugs)
 DBI::dbDisconnect(mwstr)
 
-# Write to excel file:
-writexl::write_xlsx(list("samples" = samples,
-                         "biota" = biota,
-                         "sites" = sites),
-                   path = "temp_data/mw_metabarcoding_225site_model_data.xlsx")
+```
 
-# To WERG drive:
-writexl::write_xlsx(list("samples" = samples,
-                          "biota" = biota,
-                          "sites" = sites),
-                    path = "~/uomShare/wergStaff/tewilkins/git-data/mw_metabarcoding_model/data/mw_metabarcoding_225site_model_data.xlsx")
+## Exploratory analysis of outliers and multicollinearity among predictor variables.
+
+Candidate predictors: "season","riffle","af","ei,"carea_km2","dor","meanq","meant"
+
+Check also correlations between ti and ei, tf and af, meant and elev
+
+```{r}
+
+plot(samples$af, samples$tf)  
+  # cor(samples$af, samples$tf) # = 0.83 (so one or other in a model)
+ # wilkins et al 2026 showed af to be more optimal
+# ei is dominated by low values, but there are fewer outliers (with potentially high leverage)
+#  if ei is log(x + 0.01)-transformed 
+# (previous studies used log10(x + 0.001)) 
+# this is probably better because values < 0.01 (below which stormwater impacts should be small) are stretched out less
+plot(log(samples$ei + 0.01), log(samples$ti+ 0.01))  
+  # cor(log(samples$ei + 0.01), log10(samples$ti+ 0.01)) # = 0.95 (so one or other in a model)
+# wilkins et al 2026 showed ei to be more optimal
+samples$lei <- log(samples$ei + 0.01)
+
+# elevation is positively skewed. No outliers if square-root transformed
+# and temperature is negatively skewed by not large outliers that would have potential high leverage
+# hist(samples$elev^0.5), hist(samples$meant)
+plot(samples$elev^0.5, samples$meant)  
+# cor(samples$elev^0.5, samples$meant)  # = 0.90 (one or other in a model)
+# (from Walsh 2025) air temperature provides a good measure of stream temperature 
+# in the absence of anthropogenic alterations to effects such as tree cover, 
+# stormwater drainage and flow modification. It also has the advantage of being 
+# compatible with a measure by which climate-warming predictions are communicated.
+
+# Catchment area is highly skewed.  A log-transform is required to normalize it.
+# hist(log(samples$carea_km2))  # hist(samples$carea_km2^0.25)
+samples$lcarea <- log(samples$carea_km2)
+
+# meanq will be modelled as a quadratic to allow for a non-linear response to meanq
+# hist(scale(samples$meanq^0.5) - scale(samples$meanq))
+# has no extreme outliers, while scale(samples$meanq) - scale(samples$meanq^0.5)
+# (Both produce a model response as required)
+samples$smeanq <- samples$meanq^0.5
+# To check how scaling affects the distribution of the resulting modal curve:
+# plot(samples$smeanq, scale(samples$meanq^0.5) - scale(samples$meanq))
+# plot(samples$smeanq, scale(samples$meanq)^0.5 - scale(samples$meanq))
+# plot(samples$smeanq, scale(samples$smeanq) - scale(samples$smeanq^2))
+# plot(samples$smeanq, scale(samples$smeanq) - scale(samples$smeanq)^2)
+# This suggests it is better to independently scale the smeanq and smeanq^2
+
+# dor of most sites ranges between 0 and 1. Eight have dor > 1, including 2 high outliers
+# In calculating dor Walsh (2025) capped dor below large service reservoirs, which never spill
+# (but release small environmental flows) at 1. We thus do the same for smaller reservoirs with
+# dor > 1 to minimise leverage of sites below such reservoirs, while retaining the scale of 
+# lower dor sites
+# 
+# hist(pmin(samples$dor,1))
+samples$dor1 <- pmin(samples$dor,1)
+
+pairs(samples[c("af","lei","lcarea","smeanq","dor1")],upper.panel = panel.cor) 
+#"season","riffle" are spread evenly across the other variables (although no riffle = 0 at high meanq or dor)
+# low correlation between main environmental effects.
+# highest 0.69 for af and meanq; and 0.68 for meanq and ldor, both acceptable 
+
+# Potential interactions to include in the model
+# To avoid conflation arising from scaling around zero, 
+# interactions should be calculated on unscaled predictors and then scaled
+# hist(scale(samples$smeanq * samples$af))  # well-behaved
+# hist(scale(samples$smeanq * samples$lei)) # well-behaved
+# hist(scale(log(samples$smeanq * samples$dor1 + 0.1))) #highly skewed if not log-transformed
+# hist(scale(samples$af * samples$lei)) # high (>1.5) low af, high ei; low (<1.25) high af, low ei
+
+samples$q_af <- samples$smeanq * samples$af
+samples$q_ei <- samples$smeanq * samples$lei
+samples$q_d <- log(samples$smeanq * samples$dor1 + 0.1)
+samples$af_ei <- samples$af * samples$lei
+
+pairs(samples[c("af","lei","lcarea","smeanq","dor1","q_af","q_ei","q_d","af_ei")],upper.panel = panel.cor) 
+
+# all interactions introduce high correlations with main effects, but perhaps this
+# doesn't matter, and they will acti similarly to the quadratic term for smeanq?
 
 ```
+
+## Subset of biota for trial analyses
+
+Begin with a tractable small set of species of varying taxonomic relationships and potential response.  Choose species with moderate prevalance (say between 25 and 75%)
+
+```{r}
+
+# Note range(biota$count) = 1,1
+# calculate prevalence on sites rather than samples
+biota$reach <- samples$reach_v12[match(biota$smpcode, samples$smpcode)]
+biot_by_site <- unique(biota[c("taxoncode","taxon","reach")])
+biot_prev <- aggregate(biot_by_site$taxoncode, 
+                       by = list(taxoncode = biot_by_site$taxoncode, taxon = biot_by_site$taxon), 
+                       FUN = length)
+biot_prev$prevalence <- biot_prev$x/length(unique(samples$reach_v12))
+biot_prev <- biot_prev[biot_prev$prevalence >= 0.2 & biot_prev$prevalence <= 0.8,]  # 111 species
+# about 1 quarter of that might be a good number to start with
+# But first quarantine a few congenerics to make the phylogenetic similarity diverse
+spp_trial <- biot_prev[grepl("QT2505",biot_prev$taxoncode) | 
+                       grepl("QT2511",biot_prev$taxoncode) |
+                       grepl("QE0609",biot_prev$taxoncode),]
+biot_prev <- biot_prev[!biot_prev$taxoncode %in% spp_trial$taxoncode,] # down to 105
+spp_trial <- rbind(spp_trial, biot_prev[seq(4,104,4),])  #33
+
+biota <- biota[biota$taxoncode %in% spp_trial$taxoncode,]  #down to 2882 records
+
+```
+
 
 ## 2. Analysis in Stan
 
@@ -350,89 +492,153 @@ The following code chunk assembles the model data for input to the Stan model `m
 #| results: "hide"
 
 # Load data from excel file
-data_list <- rio::import_list("temp_data/mw_metabarcoding_225site_model_data.xlsx")
-
-samples <- data_list$samples
-biota <- data_list$biota
+# data_list <- rio::import_list("temp_data/mw_metabarcoding_225site_model_data.xlsx")
+# 
+# samples <- data_list$samples
+# biota <- data_list$biota
 
 ### Preparing predictor data
 
 # scale fixed predictor variables
 # keeping them as scaled objects for ease of back-transforming later
-I <- scale(log(samples$ei + 0.01))
+I <- scale(samples$lei)
 F <- scale(samples$af)
-Q <- scale(samples$meanq^0.5)
-Q2 <- scale(samples$meanq^0.5)^2
-C <- scale(log(samples$carea_km2))
-D <- scale(pmin(samples$dor, 1))
+F2 <- scale(samples$af^2)
+Q <- scale(samples$smeanq)
+Q2 <- scale(samples$smeanq^2)
+C <- scale(samples$lcarea)
+D <- scale(samples$dor1)
 T <- scale(samples$meant)
-nriff <- scale(samples$riffle)
+T2 <- scale(samples$meant^2)
+Q_F <- scale(samples$q_af)
+Q_I <- scale(samples$q_ei)
+Q_D <- scale(samples$q_d)
+F_I <- scale(samples$af_ei)
+# I don't think it is necessary to scale these two binary variables
+nriff <- samples$riffle
+season <- samples$season
 
 # Random effects
-site <- samples$siteno
-site_group <- samples$site_group
-season <- as.numeric(as.factor(samples$season)) # Autumn = 1, Spring = 2
+site <- samples$site_no
+ # I don't think site_group is necessary with the distance matrix. For discussion
+# site_group <- samples$site_group
 
-# Coordinates
-coords <- unique(samples[,c("siteno", "coord_X", "coord_Y")])
-coords_XY <- cbind(coords$coord_X, coords$coord_Y)
-distm_XY <- scale(stats::dist(coords_XY), center = FALSE)
-
+# # Coordinates
+# coords <- unique(samples[,c("siteno", "coord_X", "coord_Y")])
+# coords_XY <- cbind(coords$coord_X, coords$coord_Y)
+# distm_XY <- scale(stats::dist(coords_XY), center = FALSE)
+# 
 ### Biota presence/absence, count and subsample percentage data
 biota_ct <- with(biota, ct(smpcode, shortcode, count))
 biota_ct <- biota_ct[match(samples$smpcode,row.names(biota_ct)),] # ensure c and u rows are ordered the same way
 
 ### Predictor matrix (u in the model)
-# Full predictor set: I, F, Q, C, D, T, nriff, Q2, IF, QF, IQ
-# Interactions: IF, QF, IQ (all first order interactions only
-# Quadratic: Q2 (for modal response of biota to runoff, Q)
-# Most plausible model did not include interactions, should remove:
+# Most plausible model did not include interactions...perhaps this was because of the scale-confounding problem???
+# But equally there is a multicollinearity problem with the interactions....re-assess if they help or not.
+
+Q_F <- scale(samples$q_af)
+Q_I <- scale(samples$q_ei)
+Q_D <- scale(samples$q_d)
+F_I <- scale(samples$af_ei)
+# I don't think it is necessary to scale these two binary variables
+nriff <- samples$riffle
+season <- samples$season
 
 # --- Predictor matrix u for morph samples
 I_mod <- as.vector(I)[match(samples$smpcode,row.names(biota_ct))]
 F_mod <- as.vector(F)[match(samples$smpcode,row.names(biota_ct))]
+F2_mod <- as.vector(F2)[match(samples$smpcode,row.names(biota_ct))]
 Q_mod <- as.vector(Q)[match(samples$smpcode,row.names(biota_ct))]
 Q2_mod <- as.vector(Q2)[match(samples$smpcode,row.names(biota_ct))]
 C_mod <- as.vector(C)[match(samples$smpcode,row.names(biota_ct))]
 D_mod <- as.vector(D)[match(samples$smpcode,row.names(biota_ct))]
 T_mod <- as.vector(T)[match(samples$smpcode,row.names(biota_ct))]
+T2_mod <- as.vector(T2)[match(samples$smpcode,row.names(biota_ct))]
+Q_F_mod <- as.vector(Q_F)[match(samples$smpcode,row.names(biota_ct))]
+Q_I_mod <- as.vector(Q_I)[match(samples$smpcode,row.names(biota_ct))]
+Q_D_mod <- as.vector(Q_D)[match(samples$smpcode,row.names(biota_ct))]
+F_I_mod <- as.vector(F_I)[match(samples$smpcode,row.names(biota_ct))]
 nriff_mod <- as.vector(nriff)[match(samples$smpcode,row.names(biota_ct))]
+season_mod <- as.vector(season)[match(samples$smpcode,row.names(biota_ct))]
 
 samples_u <- cbind(I = I_mod,                   # Effective imperviousness
                    F = F_mod,                   # Attenuated Forest cover
                    Q = Q_mod,                   # mean annual runoff
+                   Q2 = Q2_mod,                 # square of Q for modal response
                    C = C_mod,                   # catchment area
                    D = D_mod,                   # Degree of regulation
                    T = T_mod,                   # Temperature  
-                   nriff = nriff_mod,           # number of riffles at site
-                   Q2 = Q2_mod,                 # square of Q for modal response
-                   IF = I_mod * F_mod,          # Interaction betwen I and F
-                   FQ = F_mod * (Q_mod + Q2_mod),      # Interaction betwen Q and F
-                   IQ = I_mod * (Q_mod + Q2_mod))      # Interaction betwen I and Q            
+                   nriff = nriff_mod,           # number of riffles at site (0 or 1)
+                   season_mod,                  # Autumn = 0, Spring = 1
+                   FI = F_I_mod,                # Interaction betwen I and F
+                   QF = Q_F_mod,                # Interaction betwen Q and F
+                   Q_I = Q_I_mod,               # Interaction between Q and I          
+                   Q_D = Q_D_mod)               # Interaction between Q and D
 
 samples_u <- samples_u[match(samples$smpcode,row.names(biota_ct)),] # ensure c and u rows are ordered the same way
-samples_u <- samples_u[,c("I","F","Q","C","D","T","nriff","Q2")] # final predictor set doesn't include interactions
-# Final predictor set: I, F, Q, C, D, T, nriff, Q2
+
+save(samples_u, I, F, F2, Q, Q2, C, D, T, T2, Q_F, Q_I, Q_D, F_I,
+     sites, samples, biota, biota_ct, dist_euc_inv_w,dist_ds_inv_w,dist_us_inv_w,
+     file = "~/uomShare/wergStaff/ChrisW/temp/223_site_model_data.rda")
+
+samples_u_1 <- cbind(I = I_mod,                   # Effective imperviousness
+                   F = F_mod,                   # Attenuated Forest cover
+                   F2 = F2_mod,                   # Attenuated Forest cover
+                   Q = Q_mod,                   # mean annual runoff
+                   Q2 = Q2_mod,                 # square of Q for modal response
+                   C = C_mod,                   # catchment area
+                   D = D_mod,                   # Degree of regulation
+                   T = T_mod,                   # Temperature  
+                   T2 = T2_mod,                   # Temperature  
+                   nriff = nriff_mod,           # number of riffles at site (0 or 1)
+                   season_mod,                  # Autumn = 0, Spring = 1
+#                   FI = F_I_mod,                # Interaction betwen I and F
+                   QF = Q_F_mod,                # Interaction betwen Q and F
+                   Q_I = Q_I_mod)               # Interaction between Q and I          
+#                   Q_D = Q_D_mod)               # Interaction between Q and D
+
+samples_u_1 <- samples_u_1[match(samples$smpcode,row.names(biota_ct)),] # ensure c and u rows are ordered the same way
+
+save(samples_u_1, I, F, F2, Q, Q2, C, D, T, T2, Q_F, Q_I, Q_D, F_I,
+     sites, samples, biota, biota_ct, dist_euc_inv_w,dist_ds_inv_w,dist_us_inv_w,
+     file = "~/uomShare/wergStaff/ChrisW/temp/223_site_model_data_1.rda")
 
 ### Assemble stan data:
-biota_225site_data <- list(n_obs = nrow(biota_ct),                 # no. samples
-                    n_pred = ncol(samples_u),                     # no. predictors
+biota_223site_data <- list(n_obs = nrow(biota_ct),                 # no. samples
+                    n_pred = ncol(samples_u_1),                     # no. predictors
                     n_taxa = ncol(biota_ct),                       # no. taxa
-                    n_site = as.integer(max(samples$siteno)),     # no. sites
-                    n_seasons = as.integer(max(season)),                # no. seasons included in the dataset
-                    u = as.matrix(samples_u),               # predictor model matrix
+                    n_site = as.integer(max(samples$site_no)),     # no. sites
+                    u = as.matrix(samples_u_1),               # predictor model matrix
                     y = as.matrix(biota_ct),
                     site = site,                            # site number for each obs
-                    season = season,                        # sampling either in Autumn (1) or Spring (2)
-                    M = as.matrix(distm_XY))
+#                    M_euc = as.matrix(dist_euc_inv_w),                            # site number for each obs
+                    M = as.matrix(dist_euc_inv_w) )   #t(dist_ds_inv_w)
+# I think t(dist_ds_inv_w) is correct, given that the model applies W to sites by row.
+# ANS-1611 (site 4) is downstream of ANS-943 (site 5).  
+# row 4 of t(dist_ds_inv_w) has a non-zero value at col 5 (thus site 4 has a non-zero W for site 5)
+# row 4 of dist_ds_inv_w does not.
+# (This doesn't matter for dist_euc_inv_w, because it is symmetric)
+
+model_fit <- rstan::stan(file = "stancode/multitaxon_pa_rSAC_cw.stan", 
+                         data = biota_223site_data, 
+               #          control = list(adapt_delta = 0.9), 
+                         seed = proj_seed, 
+                         chains = 1,
+                         warmup = 1000,
+                         iter = 2000)
+save(model_fit, file = "~/uomShare/wergStaff/ChrisW/temp/model_run_1_dist_euc_gamma_F2_T2.rda")
+# tds 60 min
+# run1_dist_euc and run1_dist_ds each took ~45 min (and maybe <10G RAM)
+# multitaxon_pa_mult_rSAC_cw.stan did not work 100% divergent transitions max Rhat NA.
+```
+
+```{r}
 
 # Write standata file to WERG drive:
-saveRDS(biota_225site_data, file = "~/uomShare/wergStaff/tewilkins/git-data/mw_metabarcoding_model/data/225site_standata.rds")
+saveRDS(biota_223site_data, file = "~/uomShare/wergStaff/tewilkins/git-data/mw_metabarcoding_model/data/223site_standata.rds")
 
 # Store files locally (e.g., for use on SPARTAN):
-saveRDS(biota_225site_data, file = "temp_data/225site_standata.rds")
-
-
+saveRDS(biota_223site_data, file = "temp_data/223site_standata.rds")
 
 ```
 
