@@ -8,8 +8,6 @@ data {
 
   matrix[n_obs, n_pred] u;               // Matrix of scaled predictors for each observation
   matrix[n_taxa, n_taxa] phylo_cor;      // Phylogenetic correlation matrix
-  matrix[n_site, n_site] riv_dist_mat;   // River distance matrix (downstream, but could be upstream for that matter)
-  matrix[n_site, n_site] is_downstream;   // 1 if path exists from j to i, 0 otherwise
 
   array[n_obs, n_taxa] int<lower=0, upper=1> y; // Presence/absence matrix
 }
@@ -26,28 +24,21 @@ parameters {
   matrix[n_pred, n_taxa] beta_raw;       
   vector<lower=0>[n_pred] scale_beta;    
 
-  // Uncorrelated error (Overdispersion) - removed mu_epsilon to eliminate identical collinearity between the species intercept and the overdispersion mean
-  // vector[n_taxa] mu_epsilon;             
+  // Uncorrelated error (Overdispersion) - MOVED mu_epsilon out
   matrix[n_obs, n_taxa] epsilon_raw;     
   real<lower=0> sigma_epsilon;           // Fixed type & bounds for non-centering
   
   // Between-predictor correlation matrix prior
   cholesky_factor_corr[n_pred] L_Omega;           
 
-  // Site random effects - removed mu_site to eliminate a second source of identical collinearity with a_taxon
+  // Site random effects - REMOVED mu_site
   matrix[n_site, n_taxa] a_site_raw;           
-  // vector[n_taxa] mu_site;                     
   vector<lower=0>[n_taxa] sigma_site;    // Added variance tracking for site effects
 
   // Taxon intercept
   vector[n_taxa] a_taxon_raw;                 
   real mu_taxon;                              
   real<lower=0> sigma_taxon;             // Added variance tracking for taxon intercepts
-
-  // Spatial autocorrelation:
-  real<lower=0> rho_space;         
-  real<lower=0> sigma_space;   
-  matrix[n_site, n_taxa] delta_raw;       // Unscaled random effects per site and taxa
 
 }
 
@@ -58,9 +49,6 @@ transformed parameters {
   matrix[n_site, n_taxa] a_site;              
   vector[n_taxa] a_taxon;
   matrix[n_obs, n_taxa] epsilon;              
-
-  matrix[n_site, n_site] Sigma_space;
-  matrix[n_site, n_taxa] delta;               
 
   // 1. Non-Centered Phylogenetic Regression Slopes
   {
@@ -74,47 +62,17 @@ transformed parameters {
   }
 }
 
-  // Non-centered asymmetric spatial drift (Matrix Solver)
+  // Non-Centered Transformations for Hierarchical Variances (Vectorized with mu_epsilon removed)
+  a_taxon = mu_taxon + a_taxon_raw .* sigma_taxon; // Vector multiplication
 
-  for (i in 1:n_site) {
-    for (j in 1:n_site) {
-      if (i == j) {
-        Sigma_space[i, j] = square(sigma_space) + 1e-5; // Diagonal jitter
-      } else if (is_downstream[i, j] == 1) {
-        // Distance is already directional from j (up) to i (down)
-        Sigma_space[i, j] = square(sigma_space) * exp(-square(riv_dist_mat[i, j]) / (2 * square(rho_space)));
-      } else {
-        Sigma_space[i, j] = 0.0; // No connection or upstream movement
-      }
-    }
-  }
-  // Non-centered parameterisation: Projects upstream signal downstream across all taxa
-  delta = Sigma_space * delta_raw;
-
-  // Non-Centered Transformations for Hierarchical Variances
-  a_taxon = mu_taxon + a_taxon_raw * sigma_taxon;
-
-  // for (j in 1:n_taxa) {
-  //   // Multiplied raw standard normals by standard deviations for mathematical validity
-  //   a_site[, j] = mu_site[j] + a_site_raw[, j] * sigma_site[j];                    
-  //   epsilon[, j] = mu_epsilon[j] + epsilon_raw[, j] * sigma_epsilon;               
-  // }
   // Vectorized site and overdispersion transformations (Removes loop overhead)
   a_site = a_site_raw .* rep_matrix(sigma_site', n_site);
-  epsilon = epsilon_raw * sigma_epsilon; // removing mu_epsilon centers at 0.
+  epsilon = epsilon_raw * sigma_epsilon; // Rigidly centered at 0 to fix NA R-hat
 
-  // Corrected Linear Predictor Mapping Loop
-  // for (j in 1:n_taxa) {
-  //   for (i in 1:n_obs) { // Fixed: Changed from n_pred to n_obs
-  //     // Solved: Vector multiplication u[i] * col(beta, j) evaluates cleanly to a scalar real.
-  //     // Fixed: Indexed a_site and delta using row AND column coordinates to pull a scalar.
-  //     mu[i, j] = a_taxon[j] + a_site[site[i], j] + (u[i] * col(beta, j)) + 
-  //                delta[site[i], j] + epsilon[i, j];
-  //   }
-  // }
-    for (j in 1:n_taxa) {
+  // 3. Linear Predictor Mapping Loop
+  for (j in 1:n_taxa) {
     // Vectorized row-wise assignment significantly helps energy/BFMI geometry
-    mu[, j] = a_taxon[j] + a_site[site, j] + (u * col(beta, j)) + delta[site, j] + epsilon[, j];
+    mu[, j] = a_taxon[j] + a_site[site, j] + (u * col(beta, j)) + epsilon[, j];
   }
 }
 
@@ -125,24 +83,17 @@ model {
   scale_beta ~ normal(0, 2);
   L_Omega ~ lkj_corr_cholesky(2.0); 
 
-  // --- Spatial Priors ---
-  to_vector(delta_raw) ~ std_normal();
-  sigma_space ~ normal(0, 0.5);
-  rho_space ~ lognormal(-1, 0.5); // Prior concentrated on the 0-1 scaled distance range
-
   // --- Genuine Random Effects Priors ---
-  // mu_site ~ normal(0, 5);    //removed above             
   to_vector(a_site_raw) ~ std_normal();   
-  sigma_site ~ normal(0, 1.5);
+  sigma_site ~ normal(0, 1);  #tightened to avoid funnel that wasn't a problem with AC
 
   mu_taxon ~ normal(0, 3);                
   a_taxon_raw ~ std_normal();             
-  sigma_taxon ~ normal(0, 1.5);
+  sigma_taxon ~ normal(0, 1); #tightened to avoid funnel that wasn't a problem with AC
   
   // --- Overdispersion Priors (Fixed Scalar Syntax) ---
-  // mu_epsilon ~ normal(0, 1);  //removed above             
   to_vector(epsilon_raw) ~ std_normal();  
-  sigma_epsilon ~ normal(0, 0.5);  
+  sigma_epsilon ~ normal(0, 0.25);  #tightened to avoid conflation with site effects that wasn't a problem with AC
 
   // --- Likelihood Estimation ---
   for (j in 1:n_taxa) {

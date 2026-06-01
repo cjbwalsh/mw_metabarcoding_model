@@ -78,7 +78,7 @@ We drew the site locations, sample specifications and species occurrence data in
 #| eval: true
 
 # Connect to MW databases:
-mwbugs <- DBI::dbConnect(RPostgres::Postgres(), dbname = "mwbugs")
+mwbugs <- DBI::dbConnect(RPostgres::Postgres(), dbname = "mwbugs", host = "localhost")
 
 ####  
 # Project 3:  Metabarcoded combined-RBA-sample-pair survey of 223 sites across
@@ -180,7 +180,7 @@ biota <- biota[biota$taxoncode %in% spp_trial$taxoncode,]  #down to 2882 records
 
 We constructed a classification object for use in the R package taxise, primarily drawing on the Integrated Taxonomic Information System (ITIS) database, validated against the taxonomic tables of the Melbourne Water Macroinvertebrate Database. We constructed taxonomic tables consistent with ITIS conventions for taxa missing from ITIS (using the code: ~/uomShare/wergStaff/ChrisW/git-data/mwbugs/build_phylo_vcv.R). 
 
-The resulting classification object can be accessed and used as shown in the following code. We used the `taxize::class2tree()` function to create a taxonomic tree, and the `ape` package to compute branch lengths to reflect evolutionary divergence and produce a variance-covariance matrix of the species.
+The resulting classification object can be accessed and used as shown in the following code. We used the `taxize::class2tree()` function to create a taxonomic tree, and the `ape` package to compute branch lengths to reflect evolutionary divergence and produce a variance-covariance matrix of the species, `spp_vcv` for input into Stan.
 
 ```{r}
 #| label: fig-spp_tree
@@ -200,6 +200,7 @@ spp_tree <- taxize::class2tree(spp_class)
 spp_tree <- ape::compute.brlen(spp_tree$phylo)
 # compute the variance-covariance matrix
 spp_vcv <- ape::vcv.phylo(spp_tree)
+
 plot(spp_tree, cex = 0.75)
 ```
 
@@ -222,48 +223,22 @@ Direct distances between sites, calculated as the Euclidean distance between the
 
 # 1. Euclidean distance (dist_euc_inv_w)
 sites_coords_km <- sf::st_coordinates(sites)/1000
+# raw distance matrix for assessing spatial patterns
 dist_euc_km <- as.matrix(stats::dist(sites_coords_km, diag = TRUE, upper = TRUE))
-
-
-```
-
-```{r}
-#| echo: false
-
-## Assessment of appropriate priors for rho, where range of nearest-neighbour distances are:
-dist_range <- c(0.15,170)
-
-## Google advice  https://share.google/aimode/SVs3hXymcnHtv0qfO
-# mode of invgamma is scale/(shape + 1), and the mode should be near or slightly larger than the minimum distance
-# shape <= 2 results in infinite variance, permitting esxploration of long-range decay patters
-alpha <- 1
-5/(2.5 -1)
-rho_prior <- invgamma::rinvgamma(1000, shape = 2.5, rate = 3)  # rate for this function is what is usually called scale
-weight_sq_inv_half_mind <- alpha^2 * exp(-0.5 * (dist_range[1]/(2*rho_prior))^2)
-weight_sq_inv_mind <- alpha^2 * exp(-0.5 * (dist_range[1]/rho_prior)^2)
-weight_sq_inv_maxd <- alpha^2 * exp(-0.5 * (dist_range[2]/rho_prior)^2)
-# posterior value...
-plot(seq(0.1,20,0.1), alpha^2 * exp(-0.5 * (seq(0.1,20,0.1)/(2*min(rho_prior)))^2))
-# 2.5, 3 limits attenuation to >~1.5 km, which is close to the limits of the dataset
-par(mfrow = c(2,2))
-hist(rho_prior, breaks = 100)
-hist(weight_sq_inv_maxd, breaks = 100)
-hist(weight_sq_inv_mind, breaks = 100)
-hist(weight_sq_inv_half_mind, breaks = 100)
-
-alpha <- 1
-rho_prior <- invgamma::rinvgamma(1000, shape = 2.5, rate = 2.5)
-weight_inv_half_mind <- alpha^2 * exp(-dist_range[1]/(2*rho_prior))
-weight_inv_mind <- alpha^2 * exp(-dist_range[1]/rho_prior)
-weight_inv_maxd <- alpha^2 * exp(-dist_range[2]/rho_prior)
-par(mfrow = c(2,2))
-hist(rho_prior, breaks = 100)
-hist(weight_inv_maxd, breaks = 100)
-hist(weight_inv_mind, breaks = 100)
-hist(weight_inv_half_mind, breaks = 100)
+max_euc_dist_km <- max(as.vector(dist_euc_km))  # 169.4
+# Standardize coordinates so that the maximum distance between sites = 1
+center <- colMeans(sites_coords_km)
+centered_coords <- sweep(sites_coords_km, 2, center, FUN = "-")
+# find maximum Euclidean distance from the center to any point
+distances <- sqrt(rowSums(centered_coords^2))
+max_dist <- max(distances)
+sites_coords_stand <- centered_coords / max_dist
+# Check the new maximum distance is 1
+max_new_dist <- max(sqrt(rowSums(sites_coords_stand^2)))
+# max_new_dist # 1, corect
+dist_euc_stand <- as.matrix(stats::dist(sites_coords_stand, diag = TRUE, upper = TRUE))
 
 ```
-
 
 
 The model (using either decay form) sampled quickly, but failed to converge. Several possible causes are:
@@ -278,8 +253,11 @@ The model (using either decay form) sampled quickly, but failed to converge. Sev
 
 River distances were calculated as the along-stream distance between each pair of sites on the same stream line, using stream lines from  the Melbourne Stream Network database [@walsh_2023].  The river distance of primary ecological importance is downstream distance, as that is the dominant direction of movement for stream macroinvertebrates through drift. Some upstream movement is also possible *, and might be considered if I can get downstream working*.
 
-Catchment area is the primary variable that may compete for variance with spatial autocorrelation along rivers.  As an approach to minimize this problem, I regressed catchment area against the longest stream distance upstream of each site, and created a new variable carea_r from the residual of that relationship.
+The following code uses the igraph pacakge in R to create an asymmetric 223 x 223 distance matrix, `M_rivds_raw`,  with downstream distances between pairs of sites, where `M_rivds_raw[i, j]` gives the river distance (in km) from the upstream site `j` to the downstream site `i`, and all other distances = Inf.  The code then manipulates this matrix to prepare two matrices of the same dimensions for use by Stan:
 
+- `is_downstream`: M_rivds_raw` with all Inf and zero (i.e. the diagonal) values = 0, and all downstream distances = 1. This is used to mask all cells with Inf values so that Stan ignores them;
+
+- `riv_dist_mat_scaled`: `M_rivds_raw` with all Inf values converted to zero, and distances scaled to range from 0 to 1 (to improve convergence)
 
 ```{r}
 #| label: river_distance_matrix
@@ -289,7 +267,7 @@ Catchment area is the primary variable that may compete for variance with spatia
 #| results: "hide"
 #| eval: true
 
-mwstr <- DBI::dbConnect(RPostgres::Postgres(), dbname = "mwstr")
+mwstr <- DBI::dbConnect(RPostgres::Postgres(), dbname = "mwstr", host = "localhost")
 
 # Add reach length and site number (i.e. the unique numeric code for each reach) 
 # from mwstr database to sites table
@@ -361,13 +339,32 @@ network_223_ig <- igraph::graph_from_data_frame(network_223_i)
 igraph::E(network_223_ig)$weight <- network_223$dist_km
 M_rivds_raw <- igraph::distances(network_223_ig, mode = "out", 
                                  weights = igraph::E(network_223_ig)$weight)
-# Stan requires D[i, j] to be FROM j TO i, so transpose
+# remove terminal nodes
+M_rivds_raw <- M_rivds_raw[which(as.numeric(row.names(M_rivds_raw)) >0),
+                           which(as.numeric(row.names(M_rivds_raw)) >0)]
+# # Stan requires D[i, j] to be FROM j TO i, so transpose
 M_rivds_raw <- t(M_rivds_raw)
-# Replace Inf values with a large number for Stan numerical stability
-M_rivds_raw[is.infinite(M_rivds_raw)] <- 99999.0
+# # Replace Inf values with a large number for Stan numerical stability
+# M_rivds_raw[is.infinite(M_rivds_raw)] <- 99999.0
 
-n_ds_pairs <- sum(M_rivds_raw != 99999 & M_rivds_raw > 0)   # 718
-M_vec <- as.vector(M_rivds_raw[M_rivds_raw != 99999 & M_rivds_raw > 0])
+# Create a binary downstream mask (1 if a downstream path exists, 0 if it is upstream/unconnected)
+is_downstream <- matrix(0, nrow = nrow(M_rivds_raw), ncol = ncol(M_rivds_raw))
+is_downstream[is.finite(M_rivds_raw) & M_rivds_raw > 0] <- 1
+diag(is_downstream) <- 0 # Ensure no self-loops
+# Clean the distance matrix for Stan (Replace Inf with 0. The mask ensures Stan will ignore these zeros).
+riv_dist_mat_clean <- M_rivds_raw
+riv_dist_mat_clean[!is.finite(riv_dist_mat_clean)] <- 0
+diag(riv_dist_mat_clean) <- 0
+# 3. Scale the distances (Crucial for squared exponential convergence)
+# Divide by the maximum observed valid distance so values are bounded between 0 and 1
+max_riv_dist <- max(riv_dist_mat_clean)  # 190 km
+riv_dist_mat_scaled <- riv_dist_mat_clean / max_riv_dist
+# # --- Verify matrix structure ---
+# cat("Dimensions: ", dim(riv_dist_mat_scaled), "\n")
+# cat("Is the distance matrix asymmetric? ", !isSymmetric(riv_dist_mat_scaled), "\n")
+# cat("Number of valid downstream paths: ", sum(is_downstream), "\n")
+
+M_vec <- as.vector(M_rivds_raw[!is.infinite(M_rivds_raw) & M_rivds_raw > 0])
 # hist(M_vec, breaks = 100)
 # range(M_vec) #  0.12, 190
 # I checked the 0.12 and it's right  BH4_1657 is only 100 m or so downstream of BH1_417
@@ -585,9 +582,7 @@ pairs(samples[c("af","lei","lcarea","smeanq","dor1","q_af","q_ei","q_d","af_ei")
 ```
 
 
-## Analysis in Stan
-
-### Assembling model data for Stan
+## Assembling model data for Stan
 
 The following code chunk assembles the model data for input to the Stan model `multitaxon_pa_rSAC.stan`.
 
@@ -601,6 +596,7 @@ The following code chunk assembles the model data for input to the Stan model `m
 # scale fixed predictor variables
 # keeping them as scaled objects for ease of back-transforming later
 I <- scale(samples$lei)
+I_tom <- scale(samples$lei_tom)
 F <- scale(samples$af)
 Q <- scale(samples$smeanq)
 Q2 <- scale(samples$smeanq^2)
@@ -629,6 +625,7 @@ biota_ct <- biota_ct[match(samples$smpcode,row.names(biota_ct)),] # ensure c and
 
 # --- Predictor matrix u for morph samples
 I_mod <- as.vector(I)[match(samples$smpcode,row.names(biota_ct))]
+I_tom_mod <- as.vector(I_tom)[match(samples$smpcode,row.names(biota_ct))]
 F_mod <- as.vector(F)[match(samples$smpcode,row.names(biota_ct))]
 Q_mod <- as.vector(Q)[match(samples$smpcode,row.names(biota_ct))]
 Q2_mod <- as.vector(Q2)[match(samples$smpcode,row.names(biota_ct))]
@@ -650,15 +647,14 @@ samples_u <- cbind(I = I_mod,                   # Effective imperviousness
                    Q = Q_mod,                   # mean annual runoff
                    Q2 = Q2_mod,                 # square of Q for modal response
                    C = C_mod,                   # catchment area
-                   # D = D_mod,                   # Degree of regulation
-                   # T = T_mod,                   # Temperature 
-                   # B = B_mod,                   # Basalt
+                   D = D_mod,                   # Degree of regulation
+                   T = T_mod,                   # Temperature 
+                   B = B_mod,                   # Basalt
                    nriff = riff_mod,            # number of riffles at site (0 or 1)
-                   season_mod)                  # Autumn = 0, Spring = 1
-                   # FI = F_I_mod,                # Interaction betwen I and F
-                   # QF = Q_F_mod,                # Interaction betwen Q and F
-                   # Q_I = Q_I_mod,               # Interaction between Q and I          
-#                   B_I = B_I_mod)               # Interaction between Q and D
+                   season_mod,                  # Autumn = 0, Spring = 1
+                   FI = F_I_mod,                # Interaction betwen I and F
+                   QF = Q_F_mod,                # Interaction betwen Q and F
+                   Q_I = Q_I_mod)              # Interaction between Q and D
 
 save(samples_u, I, F, Q, Q2, C, D, T, B, Q_F, Q_I, Q_D, F_I, B_I, #saved for scaling parameters
      sites, samples, biota, biota_ct, dist_euc_km, 
@@ -666,27 +662,151 @@ save(samples_u, I, F, Q, Q2, C, D, T, B, Q_F, Q_I, Q_D, F_I, B_I, #saved for sca
 
 
 ### Assemble stan data:
-biota_223site_data <- list(n_obs = nrow(biota_ct),                 # no. samples
-                           n_pred = ncol(samples_u),             # no. predictors
-                           n_taxa = ncol(biota_ct),                # no. taxa
-                           n_site = max(site),                     # no. sites with a site upstream
-                           u = as.matrix(samples_u),             # predictor model matrix
-                           y = as.matrix(biota_ct),
-                           site = site,                            # site number for each obs
-#                           M = dist_euc_km)   
-                           coords = sf::st_coordinates(sites)/1000)  # distances in km
+ifqdtbrs_fi_qf_qd_phylo_ac_data <- list(n_obs = nrow(biota_ct),                # no. samples
+                        n_pred = ncol(samples_u),             # no. predictors
+                        n_taxa = ncol(biota_ct),              # no. taxa
+                        n_site = max(site),                   # no. sites with a site upstream
+                        u = as.matrix(samples_u),             # predictor model matrix
+                        y = as.matrix(biota_ct),
+                        site = site,
+                        phylo_cor = spp_vcv,                    # Phylogenetic covariance 
+                        riv_dist_mat = riv_dist_mat_scaled,   # downstream distance matrix
+                        is_downstream = is_downstream)        # mask to identify those sites downstream of another
 
-model_fit <- rstan::stan(file = "~/git/mw_metabarcoding_model/stancode/multitaxon_pa_ac_euc.stan",
-                         data = biota_223site_data,
-                         save_warmup = TRUE,
-               #          control = list(adapt_delta = 0.9),
+```
+
+### Run competing Stan models
+
+Start with simple minimum no predictors for comparison of models with and without a spatial autocorrelation effect, and with and without phylogenetic covariance
+
+```{r}
+ifqrs_data <- ifqdtbrs_fi_qf_qd_phylo_ac_data 
+ifqrs_data$u <- ifqrs_data$u[,colnames(ifqrs_data$u) %in% c("I","F","Q","Q2","nriff","season_mod")]
+ifqrs_data$n_pred <- ncol(ifqrs_data$u)
+
+# ### with Euclidean autocorrelation and phylogenetic covariance
+# ifqrs_data_euc <- ifqrs_data[!names(ifqrs_data) %in% c("riv_dist_mat","is_downstream")]
+# ifqrs_data_euc$euc_dist_mat <- dist_euc_stand
+# mod_code <- "ifqrs_ac_euc"
+# model_fit <- rstan::stan(file = "~/git/mw_metabarcoding_model/stancode/multitaxon_pa_ac_euc.stan",
+#                          data = ifqrs_data_euc,
+#                          seed = proj_seed,
+#                          # save_warmup = TRUE,  # checked on first run: 500 warm-up plenty
+#                          chains = 1, cores = parallel::detectCores(),
+#                          warmup = 500,
+#                          iter = 10500) # 28 min for 2000 iterations
+# saveRDS(model_fit, file = paste0("~/uomShare/wergStaff/ChrisW/temp/model_",
+#                                   mod_code, ".rds")) 
+
+```
+
+```{r}
+
+# ### with Euclidean autocorrelation and phylogenetic covariance
+# ifqrs_data_euc <- ifqrs_data[!names(ifqrs_data) %in% c("riv_dist_mat","is_downstream")]
+# ifqrs_data_euc$euc_dist_mat <- dist_euc_stand
+# mod_code <- "ifqrs_ac_euc"
+# model_fit <- rstan::stan(file = "~/git/mw_metabarcoding_model/stancode/multitaxon_pa_ac_euc.stan",
+#                          data = ifqrs_data_euc,
+#                          seed = proj_seed,
+#                          save_warmup = TRUE,
+#                          chains = 1, cores = parallel::detectCores(),
+#                          warmup = 500,
+#                          iter = 1500) # 28 min min Bulk ESS 15, so need 6000?
+# saveRDS(model_fit, file = paste0("~/uomShare/wergStaff/ChrisW/temp/model_",
+#                                   mod_code, ".rds")) 
+# 
+# ### with downstream autocorrelation and phylogenetic covariance, but EI transformed as log(x + 0.01)
+# ifqrs_data_itom <- ifqrs_data
+# ifqrs_data_itom$u[colnames(ifqrs_data$u) == "I"] <- I_tom_mod
+# mod_code <- "ifqrs_ac_riv_itom"
+# model_fit <- rstan::stan(file = "~/git/mw_metabarcoding_model/stancode/multitaxon_pa_ac_riv.stan",
+#                          data = ifqrs_data_itom,
+#                          seed = proj_seed,
+#                          chains = 1, cores = parallel::detectCores(),
+#                          warmup = 500,
+#                          iter = 5500) # 56 min, Bulk ESS too low?
+# saveRDS(model_fit, file = paste0("~/uomShare/wergStaff/ChrisW/temp/model_",
+#                                   mod_code, ".rds")) 
+# 
+# ### with downstream autocorrelation but no phylogenetic covariance
+# mod_code <- "ifqrs_ac_riv_NO_phylo"
+# model_fit <- rstan::stan(file = "~/git/mw_metabarcoding_model/stancode/multitaxon_pa_ac_riv_NO_phylo.stan",
+#                          data = ifqrs_data,
+#                          seed = proj_seed,
+#                          chains = 1, cores = parallel::detectCores(),
+#                          warmup = 500,
+#                          iter = 5500)  # 46 min, 1 divergence 
+# saveRDS(model_fit, file = paste0("~/uomShare/wergStaff/ChrisW/temp/model_",
+#                                   mod_code, ".rds"))
+# 
+# ### with phylogenetic covariance but no autocorrelation
+# mod_code <- "ifqrs_NO_ac"
+# model_fit <- rstan::stan(file = "~/git/mw_metabarcoding_model/stancode/multitaxon_pa_NO_ac.stan",
+#                          data = ifqrs_data,
+#                          seed = proj_seed,
+#                          chains = 1, cores = parallel::detectCores(),
+#                          warmup = 500,
+#                          iter = 5500) # 1 h, 8 divergences, min Tail ESS 78. 
+#                                       # Leave as is for now after adjusting priors and correcting the phylo step
+# saveRDS(model_fit, file = paste0("~/uomShare/wergStaff/ChrisW/temp/model_",
+#                                   mod_code, ".rds"))  
+# 
+### with downstream AC and phylogenetic covariance
+mod_code <- "ifqrs_ac_riv"
+model_fit <- rstan::stan(file = "~/git/mw_metabarcoding_model/stancode/multitaxon_pa_ac_riv.stan",
+                         data = ifqrs_data,
+                         # save_warmup = TRUE, # inspection of first run showed 500 is plenty
                          seed = proj_seed,
-                         chains = 1,
-                         warmup = 2500,
-                         iter = 3500)
-# save(model_fit, file = "~/uomShare/wergStaff/ChrisW/temp/model_ifqcrs_ac_euc.rda")
+                         chains = 4, cores = 4,
+                         warmup = 500,
+                         iter = 2500) # ~ 1 h for 4500, but it exceeded 64 G RAM
+saveRDS(model_fit, file =  paste0("~/uomShare/wergStaff/ChrisW/temp/model_",
+                                  mod_code, ".rds")) 
 
-# rstan::stan_trace(model_fit, pars = c("rho"))  #, "alpha"
+###
+# saveRDS(model_fit, file = "~/uomShare/wergStaff/ChrisW/temp/model_ifqcdtbrs_fi_qf_qi_ac_riv.rds") 
+# ifqdtbrs_fi_qf_qd_ac with incorrect AC code (i.e. no ac modelled) saved as ifqdtbrs_fi_qf_qd_ac_riv.rda
+# 500 & 3200 with warmup saved for model_ifqdtbrs_fi_qf_qd_ac_riv.rds 
+# 500 & 10000 with warmup saved  for model_ifqcdtbrs_ac_riv.rds (6h)
+
+```
+
+```{r}
+rstan::stan_trace(model_fit, "rho_space", inc_warmup = TRUE)  #, "alpha"
+rstan::stan_trace(model_fit, "lp__", inc_warmup = TRUE)  #, "alpha"
+# This suggests a warmup of 500 iterations is sufficient: but 100 post-warmup produced only 32 bulk ESS (46 tail)
+# Let's try 3200 post-warmup.
+# species names 
+taxon_all <- DBI::dbReadTable(mwbugs, "taxon_all")
+species <- data.frame(species_no = 1:33, 
+                      species = taxon_all$taxon[match(names(as.data.frame(biota_ct)), taxon_all$shortcode)])
+
+preds <- c("I", "F", "Q", "Q2", "C", "D", "T", "B", "rif", "seasn")
+# preds <- c("I", "F", "Q", "Q2", "C", "D", "T", "B", "rif", "seasn","FI","QF","QI")
+library(ggplot2)
+# Check betas
+for(i in 1:nrow(species)){
+  names(preds) <- paste0("beta[", 1:length(preds), ",", i, "]")
+  p <- rstan::stan_plot(model_fit, pars = paste0("beta[", 1:length(preds), ",", i, "]"))  
+  p_custom <- p + ggtitle(species$species[i]) + scale_y_continuous(breaks = 1:length(preds), labels = rev(preds)) +
+    theme(plot.margin = unit(c(4, 4, 1, 1), "lines") )
+  print(p_custom)
+}  # All plots make excellent sense
+# Check deltas
+sp_vec <- species$species
+# Sites you might expect a spatial autocorrelation effect
+sites_ac_prob <- vector("numeric")
+for(i in 1:nrow(M_rivds_raw)){
+  if(sum(M_rivds_raw[i,] != 99999) -1 > 0) sites_ac_prob <- c(sites_ac_prob, i)
+}
+for(i in sites_ac_prob){
+  names(sp_vec) <- paste0("delta[", i, ",", 1:33, "]")
+  p <- rstan::stan_plot(model_fit, pars = paste0("delta[", i, ",", 1:33, "]"))  
+  p_custom <- p + ggtitle(sites$reach_v12[i]) + scale_y_continuous(breaks = 1:33, labels = rev(sp_vec))
+  print(p_custom)
+}  # All plots make excellent sense
+
 ```
 
 ```{r}

@@ -7,17 +7,10 @@ data {
   array[n_obs] int<lower=1, upper=n_site> site; // Site index for each sample
 
   matrix[n_obs, n_pred] u;               // Matrix of scaled predictors for each observation
-  matrix[n_taxa, n_taxa] phylo_cor;      // Phylogenetic correlation matrix
   matrix[n_site, n_site] riv_dist_mat;   // River distance matrix (downstream, but could be upstream for that matter)
   matrix[n_site, n_site] is_downstream;   // 1 if path exists from j to i, 0 otherwise
 
   array[n_obs, n_taxa] int<lower=0, upper=1> y; // Presence/absence matrix
-}
-
-transformed data {
-  matrix[n_taxa, n_taxa] L_phylo;
-  // Pre-decomposing static data here saves massive computational overhead
-  L_phylo = cholesky_decompose(phylo_cor);
 }
 
 parameters {
@@ -62,17 +55,15 @@ transformed parameters {
   matrix[n_site, n_site] Sigma_space;
   matrix[n_site, n_taxa] delta;               
 
-  // 1. Non-Centered Phylogenetic Regression Slopes
+  // Non-Centered Regression Slopes
   {
-  matrix[n_pred, n_taxa] beta_phylo_raw = beta_raw * L_phylo'; 
-  matrix[n_pred, n_pred] L_Sigma_beta = diag_pre_multiply(scale_beta, L_Omega);
-  
-  for (k in 1:n_pred) {
-    for (s in 1:n_taxa) {
-      beta[k, s] = mu_beta[k] + dot_product(L_Sigma_beta[k, ], beta_phylo_raw[, s]);
+    matrix[n_pred, n_pred] L_Sigma_beta = diag_pre_multiply(scale_beta, L_Omega);
+    for (k in 1:n_pred) {
+      for (s in 1:n_taxa) {
+        beta[k, s] = mu_beta[k] + dot_product(L_Sigma_beta[k, ], beta_raw[, s]);
+      }
     }
   }
-}
 
   // Non-centered asymmetric spatial drift (Matrix Solver)
 
