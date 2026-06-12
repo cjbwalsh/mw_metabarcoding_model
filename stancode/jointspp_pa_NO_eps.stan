@@ -24,15 +24,12 @@ parameters {
   matrix[n_pred, n_taxa] beta_raw;       
   vector<lower=0>[n_pred] scale_beta;    
 
-  // Uncorrelated error (Overdispersion) - MOVED mu_epsilon out
-  matrix[n_obs, n_taxa] epsilon_raw;     
-  real<lower=0> sigma_epsilon;           // Fixed type & bounds for non-centering
-  
   // Between-predictor correlation matrix prior
   cholesky_factor_corr[n_pred] L_Omega;           
 
-  // Site random effects - REMOVED mu_site
+  // Site random effects - removed mu_site to eliminate a second source of identical collinearity with a_taxon
   matrix[n_site, n_taxa] a_site_raw;           
+  // vector[n_taxa] mu_site;                     
   vector<lower=0>[n_taxa] sigma_site;    // Added variance tracking for site effects
 
   // Taxon intercept
@@ -48,7 +45,6 @@ transformed parameters {
   matrix[n_pred, n_taxa] beta;                
   matrix[n_site, n_taxa] a_site;              
   vector[n_taxa] a_taxon;
-  matrix[n_obs, n_taxa] epsilon;              
 
   // 1. Non-Centered Phylogenetic Regression Slopes
   {
@@ -62,17 +58,16 @@ transformed parameters {
   }
 }
 
-  // Non-Centered Transformations for Hierarchical Variances (Vectorized with mu_epsilon removed)
-  a_taxon = mu_taxon + a_taxon_raw .* sigma_taxon; // Vector multiplication
+  // Non-Centered Transformations for Hierarchical Variances
+  a_taxon = mu_taxon + a_taxon_raw * sigma_taxon;
 
+  // for (j in 1:n_taxa) {
   // Vectorized site and overdispersion transformations (Removes loop overhead)
   a_site = a_site_raw .* rep_matrix(sigma_site', n_site);
-  epsilon = epsilon_raw * sigma_epsilon; // Rigidly centered at 0 to fix NA R-hat
 
-  // 3. Linear Predictor Mapping Loop
-  for (j in 1:n_taxa) {
+    for (j in 1:n_taxa) {
     // Vectorized row-wise assignment significantly helps energy/BFMI geometry
-    mu[, j] = a_taxon[j] + a_site[site, j] + (u * col(beta, j)) + epsilon[, j];
+    mu[, j] = a_taxon[j] + a_site[site, j] + (u * col(beta, j));
   }
 }
 
@@ -84,17 +79,14 @@ model {
   L_Omega ~ lkj_corr_cholesky(2.0); 
 
   // --- Genuine Random Effects Priors ---
+  // mu_site ~ normal(0, 5);    //removed above             
   to_vector(a_site_raw) ~ std_normal();   
-  sigma_site ~ normal(0, 1);  #tightened to avoid funnel that wasn't a problem with AC
+  sigma_site ~ normal(0, 1.5);
 
   mu_taxon ~ normal(0, 3);                
   a_taxon_raw ~ std_normal();             
-  sigma_taxon ~ normal(0, 1); #tightened to avoid funnel that wasn't a problem with AC
+  sigma_taxon ~ normal(0, 1.5);
   
-  // --- Overdispersion Priors (Fixed Scalar Syntax) ---
-  to_vector(epsilon_raw) ~ std_normal();  
-  sigma_epsilon ~ normal(0, 0.25);  #tightened to avoid conflation with site effects that wasn't a problem with AC
-
   // --- Likelihood Estimation ---
   for (j in 1:n_taxa) {
     y[, j] ~ bernoulli_logit(mu[, j]); 
@@ -103,17 +95,13 @@ model {
 
 generated quantities {
   array[n_obs, n_taxa] int<lower=0, upper=1> y_rep; // Simulated replica data
-  vector[n_site] log_lik; // vector of length n_site for site-level LOO-CV                         
+  vector[n_obs * n_taxa] log_lik;                  // Flattened observation-by-taxon log-likelihood
   vector[n_taxa] tjurs_r2;                         // Explanatory power per taxon
  
-  // Initialize log_lik vector to 0
-  for (s in 1:n_site) {
-    log_lik[s] = 0.0;
-  }
-  
-    {
-  // Temporary tracking vectors to calculate Tjur's R2 per taxon
-  for (j in 1:n_taxa) {
+  {
+    int idx = 1; // Counter to flatten the log_lik vector
+    
+    for (j in 1:n_taxa) {
       real sum_prob_pres = 0.0;
       real sum_prob_abs = 0.0;
       real n_pres = 0.0;
@@ -121,10 +109,15 @@ generated quantities {
       
       for (i in 1:n_obs) {
         real prob = inv_logit(mu[i, j]);
-        y_rep[i, j] = bernoulli_rng(prob); // Generate posterior predictive data
-        // Accumulate log-likelihood into the site index (sum all taxa (j) and all observations (i) belonging to each site)
-        log_lik[site[i]] += bernoulli_logit_lpmf(y[i, j] | mu[i, j]);
-        // Track values for Tjur's R2 calculation
+        
+        // 1. Generate posterior predictive data
+        y_rep[i, j] = bernoulli_rng(prob); 
+        
+        // 2. Calculate point-level log-likelihood (Observation x Taxon)
+        log_lik[idx] = bernoulli_logit_lpmf(y[i, j] | mu[i, j]);
+        idx += 1;
+        
+        // 3. Track values for Tjur's R2 calculation
         if (y[i, j] == 1) {
           sum_prob_pres += prob;
           n_pres += 1.0;
@@ -133,6 +126,8 @@ generated quantities {
           n_abs += 1.0;
         }
       }
+      
+      // Calculate final Tjur's R2 for the taxon
       if (n_pres > 0 && n_abs > 0) {
         tjurs_r2[j] = (sum_prob_pres / n_pres) - (sum_prob_abs / n_abs);
       } else {

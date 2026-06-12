@@ -7,10 +7,17 @@ data {
   array[n_obs] int<lower=1, upper=n_site> site; // Site index for each sample
 
   matrix[n_obs, n_pred] u;               // Matrix of scaled predictors for each observation
+  matrix[n_taxa, n_taxa] phylo_cor;      // Phylogenetic correlation matrix
   matrix[n_site, n_site] riv_dist_mat;   // River distance matrix (downstream, but could be upstream for that matter)
   matrix[n_site, n_site] is_downstream;   // 1 if path exists from j to i, 0 otherwise
 
   array[n_obs, n_taxa] int<lower=0, upper=1> y; // Presence/absence matrix
+}
+
+transformed data {
+  matrix[n_taxa, n_taxa] L_phylo;
+  // Pre-decomposing static data here saves massive computational overhead
+  L_phylo = cholesky_decompose(phylo_cor);
 }
 
 parameters {
@@ -38,7 +45,7 @@ parameters {
   real<lower=0> sigma_taxon;             // Added variance tracking for taxon intercepts
 
   // Spatial autocorrelation:
-  real<lower=0> rho_space;         
+  real<lower=1e-4> rho_space;         
   real<lower=0> sigma_space;   
   matrix[n_site, n_taxa] delta_raw;       // Unscaled random effects per site and taxa
 
@@ -55,27 +62,30 @@ transformed parameters {
   matrix[n_site, n_site] Sigma_space;
   matrix[n_site, n_taxa] delta;               
 
-  // Non-Centered Regression Slopes
+  // 1. Non-Centered Phylogenetic Regression Slopes
   {
-    matrix[n_pred, n_pred] L_Sigma_beta = diag_pre_multiply(scale_beta, L_Omega);
-    for (k in 1:n_pred) {
-      for (s in 1:n_taxa) {
-        beta[k, s] = mu_beta[k] + dot_product(L_Sigma_beta[k, ], beta_raw[, s]);
-      }
+  matrix[n_pred, n_taxa] beta_phylo_raw = beta_raw * L_phylo'; 
+  matrix[n_pred, n_pred] L_Sigma_beta = diag_pre_multiply(scale_beta, L_Omega);
+  
+  for (k in 1:n_pred) {
+    for (s in 1:n_taxa) {
+      beta[k, s] = mu_beta[k] + dot_product(L_Sigma_beta[k, ], beta_phylo_raw[, s]);
     }
   }
+}
 
   // Non-centered asymmetric spatial drift (Matrix Solver)
-
-  for (i in 1:n_site) {
+ for (i in 1:n_site) {
     for (j in 1:n_site) {
       if (i == j) {
-        Sigma_space[i, j] = square(sigma_space) + 1e-5; // Diagonal jitter
+        // Scale jitter to the variance parameter to prevent geometry collapse 
+        Sigma_space[i, j] = square(sigma_space) + (sigma_space * 1e-4) + 1e-5;  
       } else if (is_downstream[i, j] == 1) {
-        // Distance is already directional from j (up) to i (down)
         Sigma_space[i, j] = square(sigma_space) * exp(-square(riv_dist_mat[i, j]) / (2 * square(rho_space)));
       } else {
-        Sigma_space[i, j] = 0.0; // No connection or upstream movement
+        // Soften the hard zero cliff to a tiny baseline value
+        //(without this or the 1e-4 jitter above, there were a small no of divergences)
+        Sigma_space[i, j] = 1e-6; 
       }
     }
   }
@@ -119,7 +129,8 @@ model {
   // --- Spatial Priors ---
   to_vector(delta_raw) ~ std_normal();
   sigma_space ~ normal(0, 0.5);
-  rho_space ~ lognormal(-1, 0.5); // Prior concentrated on the 0-1 scaled distance range
+  // Old: rho_space ~ lognormal(-1, 0.5);
+rho_space ~ inv_gamma(2, 0.5); // Adjust parameters to match your scale if needed
 
   // --- Genuine Random Effects Priors ---
   // mu_site ~ normal(0, 5);    //removed above             
@@ -143,17 +154,13 @@ model {
 
 generated quantities {
   array[n_obs, n_taxa] int<lower=0, upper=1> y_rep; // Simulated replica data
-  vector[n_site] log_lik; // vector of length n_site for site-level LOO-CV                         
+  vector[n_obs * n_taxa] log_lik;                  // Flattened observation-by-taxon log-likelihood
   vector[n_taxa] tjurs_r2;                         // Explanatory power per taxon
  
-  // Initialize log_lik vector to 0
-  for (s in 1:n_site) {
-    log_lik[s] = 0.0;
-  }
-  
-    {
-  // Temporary tracking vectors to calculate Tjur's R2 per taxon
-  for (j in 1:n_taxa) {
+  {
+    int idx = 1; // Counter to flatten the log_lik vector
+    
+    for (j in 1:n_taxa) {
       real sum_prob_pres = 0.0;
       real sum_prob_abs = 0.0;
       real n_pres = 0.0;
@@ -161,10 +168,15 @@ generated quantities {
       
       for (i in 1:n_obs) {
         real prob = inv_logit(mu[i, j]);
-        y_rep[i, j] = bernoulli_rng(prob); // Generate posterior predictive data
-        // Accumulate log-likelihood into the site index (sum all taxa (j) and all observations (i) belonging to each site)
-        log_lik[site[i]] += bernoulli_logit_lpmf(y[i, j] | mu[i, j]);
-        // Track values for Tjur's R2 calculation
+        
+        // 1. Generate posterior predictive data
+        y_rep[i, j] = bernoulli_rng(prob); 
+        
+        // 2. Calculate point-level log-likelihood (Observation x Taxon)
+        log_lik[idx] = bernoulli_logit_lpmf(y[i, j] | mu[i, j]);
+        idx += 1;
+        
+        // 3. Track values for Tjur's R2 calculation
         if (y[i, j] == 1) {
           sum_prob_pres += prob;
           n_pres += 1.0;
@@ -173,6 +185,8 @@ generated quantities {
           n_abs += 1.0;
         }
       }
+      
+      // Calculate final Tjur's R2 for the taxon
       if (n_pres > 0 && n_abs > 0) {
         tjurs_r2[j] = (sum_prob_pres / n_pres) - (sum_prob_abs / n_abs);
       } else {

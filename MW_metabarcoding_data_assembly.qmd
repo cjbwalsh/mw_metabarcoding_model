@@ -12,6 +12,14 @@ editor_options:
 #| label: setup
 #| echo: false
 
+library(cmdstanr)
+# Appends the threading variable to your Stan makefile configuration
+cpp_options <- list(stan_threads = TRUE)
+library(posterior)
+library(bayesplot)
+color_scheme_set("brightblue")
+library(loo)
+
 # Random seed to fix Stan results
 proj_seed <- 12345 
 set.seed(proj_seed)
@@ -163,16 +171,25 @@ biot_prev <- aggregate(biot_by_site$taxoncode,
                        by = list(taxoncode = biot_by_site$taxoncode, taxon = biot_by_site$taxon), 
                        FUN = length)
 biot_prev$prevalence <- biot_prev$x/length(unique(samples$reach_v12))
-biot_prev <- biot_prev[biot_prev$prevalence >= 0.2 & biot_prev$prevalence <= 0.8,]  # 111 species
+biot_prevalent <- biot_prev[biot_prev$prevalence >= 0.2 & biot_prev$prevalence <= 0.8,]  # 111 species
+biot_non_prevalent <- biot_prev[!biot_prev$taxoncode %in% biot_prevalent$taxoncode,] #777 species
 # about 1 quarter of that might be a good number to start with
 # But first quarantine a few congenerics to make the phylogenetic similarity diverse
-spp_trial <- biot_prev[grepl("QT2505",biot_prev$taxoncode) | 
-                       grepl("QT2511",biot_prev$taxoncode) |
-                       grepl("QE0609",biot_prev$taxoncode),]
-biot_prev <- biot_prev[!biot_prev$taxoncode %in% spp_trial$taxoncode,] # down to 105
-spp_trial <- rbind(spp_trial, biot_prev[seq(4,104,4),])  #33
+spp_trial <- biot_prevalent[grepl("QT2505",biot_prevalent$taxoncode) | 
+                            grepl("QT2511",biot_prevalent$taxoncode) |
+                            grepl("QE0609",biot_prevalent$taxoncode),]
+biot_prevalent <- biot_prevalent[!biot_prevalent$taxoncode %in% spp_trial$taxoncode,] # down to 104
+spp_trial <- rbind(spp_trial, biot_prevalent[seq(4,104,4),])  #subset of 33 for preliminary trial
+# A secondary subset for model selection without epsilon parameter: all prevalent species + 
+# 96 others, with increased chance of congenerics by selecting the adjacent species
+spp_trial_1 <- biot_prevalent
+for(i in 1:nrow(biot_prevalent)){
+spp_trial_1 <- unique(rbind(spp_trial_1, biot_prev[which(biot_prev$taxon == biot_prevalent$taxon[i]) + 1,]))
+} # 190  = ~ 20% of the full set. Not a bad starting point
 
-biota <- biota[biota$taxoncode %in% spp_trial$taxoncode,]  #down to 2882 records
+biota_all <- biota
+biota <- biota_all[biota_all$taxoncode %in% spp_trial$taxoncode,]  #down to 2882 records
+biota_1 <- biota_all[biota_all$taxoncode %in% spp_trial_1$taxoncode,]  #10666 records
 
 ```
 
@@ -191,17 +208,25 @@ The resulting classification object can be accessed and used as shown in the fol
 #| fig-width: 6
 #| fig-cap: "The taxonomic tree for the trial subset of 33 species modelled here" 
 
-spp_class <- readRDS(
+spp_class_all <- readRDS(
   url("https://tools.thewerg.unimelb.edu.au/mwbugs/data/spp_classes_itis.rds"))
 # Select the subset of taxa relevant for the current analysis (or use all 982 spp)
-spp_class <- spp_class[c(spp_trial$taxon)]
+spp_class <- spp_class_all[c(spp_trial$taxon)]
 spp_tree <- taxize::class2tree(spp_class)
 # compute branch lengths to reflect evolutionary divergence
 spp_tree <- ape::compute.brlen(spp_tree$phylo)
 # compute the variance-covariance matrix
 spp_vcv <- ape::vcv.phylo(spp_tree)
 
+spp_class_1 <- spp_class_all[c(spp_trial_1$taxon)]
+spp_tree_1 <- taxize::class2tree(spp_class_1)
+# compute branch lengths to reflect evolutionary divergence
+spp_tree_1 <- ape::compute.brlen(spp_tree_1$phylo)
+# compute the variance-covariance matrix
+spp_vcv_1 <- ape::vcv.phylo(spp_tree_1)
+
 plot(spp_tree, cex = 0.75)
+plot(spp_tree_1, cex = 0.5)
 ```
 
 
@@ -454,6 +479,12 @@ samples$meanq <- cat_env$meanq_mm[match(samples$reach_v12,cat_env$reach)]
 samples$meant <- subc_env$meant_y30_2022[match(samples$reach_v12,subc_env$reach)] 
 # Elevation above sea-level (m). See Walsh (2023) Chapter 5.9
 samples$elev <- subc_env$elev_asl_m[match(samples$reach_v12,subc_env$reach)]
+# A lowland/estuarine influenc indicator
+samples$lowness <- -1
+samples$lowness[samples$elev < 30] <- -0.5
+samples$lowness[samples$elev < 15] <- 0
+samples$lowness[samples$elev < 7.5] <- 0.5
+samples$lowness[samples$elev < 2.5] <- 1
 
 # Order by site and season
 samples <- samples[order(samples$site_no, samples$date),] 
@@ -566,9 +597,10 @@ samples$b_ei <- samples$basalt * samples$lei
 samples$q_d <- log(samples$smeanq * samples$dor1 + 0.1)
 samples$af_ei <- samples$af * samples$lei
 
-pairs(samples[c("af","lei","lcarea","smeanq","dor1","basalt")],upper.panel = panel.cor) 
+pairs(samples[c("af","lei","lcarea","smeanq","dor1","basalt","lowness")],upper.panel = panel.cor) 
 
 ```
+
 ```{r}
 #| label: fig-pairs_2
 #| fig-height: 7
@@ -580,7 +612,6 @@ pairs(samples[c("af","lei","lcarea","smeanq","dor1","basalt")],upper.panel = pan
 pairs(samples[c("af","lei","lcarea","smeanq","dor1","q_af","q_ei","q_d","af_ei")],upper.panel = panel.cor) 
 
 ```
-
 
 ## Assembling model data for Stan
 
@@ -609,6 +640,7 @@ Q_I <- scale(samples$q_ei)
 Q_D <- scale(samples$q_d)
 F_I <- scale(samples$af_ei)
 B_I <- scale(samples$b_ei)
+L <- samples$lowness
 riffle <- samples$riffle
 season <- samples$season
 
@@ -618,6 +650,9 @@ site <- samples$site_no
 ### Biota presence/absence, count and subsample percentage data
 biota_ct <- with(biota, ct(smpcode, shortcode, count))
 biota_ct <- biota_ct[match(samples$smpcode,row.names(biota_ct)),] # ensure c and u rows are ordered the same way
+
+biota_1_ct <- with(biota_1, ct(smpcode, shortcode, count))
+biota_1_ct <- biota_1_ct[match(samples$smpcode,row.names(biota_1_ct)),] # ensure c and u rows are ordered the same way
 
 ### Predictor matrix (u in the model)
 # Most plausible model did not include interactions...perhaps this was because of the scale-confounding problem???
@@ -633,6 +668,7 @@ C_mod <- as.vector(C)[match(samples$smpcode,row.names(biota_ct))]
 D_mod <- as.vector(D)[match(samples$smpcode,row.names(biota_ct))]
 T_mod <- as.vector(T)[match(samples$smpcode,row.names(biota_ct))]
 B_mod <- as.vector(B)[match(samples$smpcode,row.names(biota_ct))]
+L_mod <- as.vector(L)[match(samples$smpcode,row.names(biota_ct))]
 Q_F_mod <- as.vector(Q_F)[match(samples$smpcode,row.names(biota_ct))]
 Q_I_mod <- as.vector(Q_I)[match(samples$smpcode,row.names(biota_ct))]
 Q_D_mod <- as.vector(Q_D)[match(samples$smpcode,row.names(biota_ct))]
@@ -641,14 +677,16 @@ B_I_mod <- as.vector(B_I)[match(samples$smpcode,row.names(biota_ct))]
 riff_mod <- as.vector(riffle)[match(samples$smpcode,row.names(biota_ct))]
 season_mod <- as.vector(season)[match(samples$smpcode,row.names(biota_ct))]
 
+
 # reduce parameters while grappling with spatial autocorrelation...
-samples_u <- cbind(I = I_mod,                   # Effective imperviousness
+samples_u_full <- cbind(I = I_mod,                   # Effective imperviousness
                    F = F_mod,                   # Attenuated Forest cover
                    Q = Q_mod,                   # mean annual runoff
                    Q2 = Q2_mod,                 # square of Q for modal response
                    C = C_mod,                   # catchment area
                    D = D_mod,                   # Degree of regulation
                    T = T_mod,                   # Temperature 
+                   L = L_mod,                   # lowness
                    B = B_mod,                   # Basalt
                    nriff = riff_mod,            # number of riffles at site (0 or 1)
                    season_mod,                  # Autumn = 0, Spring = 1
@@ -656,12 +694,14 @@ samples_u <- cbind(I = I_mod,                   # Effective imperviousness
                    QF = Q_F_mod,                # Interaction betwen Q and F
                    Q_I = Q_I_mod)              # Interaction between Q and D
 
-save(samples_u, I, F, Q, Q2, C, D, T, B, Q_F, Q_I, Q_D, F_I, B_I, #saved for scaling parameters
+save(samples_u_full, I, F, Q, Q2, C, D, T, B, Q_F, Q_I, Q_D, F_I, B_I, #saved for scaling parameters
      sites, samples, biota, biota_ct, dist_euc_km, 
      file = "~/uomShare/wergStaff/ChrisW/temp/model_allvars_data.rda")
 
+# Did not include L in first spp_trial models
+samples_u <- samples_u_full[,colnames(samples_u_full) != "L"]
 
-### Assemble stan data:
+### Assemble stan data for first trial set:
 ifqdtbrs_fi_qf_qd_phylo_ac_data <- list(n_obs = nrow(biota_ct),                # no. samples
                         n_pred = ncol(samples_u),             # no. predictors
                         n_taxa = ncol(biota_ct),              # no. taxa
@@ -672,7 +712,17 @@ ifqdtbrs_fi_qf_qd_phylo_ac_data <- list(n_obs = nrow(biota_ct),                #
                         phylo_cor = spp_vcv,                    # Phylogenetic covariance 
                         riv_dist_mat = riv_dist_mat_scaled,   # downstream distance matrix
                         is_downstream = is_downstream)        # mask to identify those sites downstream of another
+rm(network_df, subcs, network, network_ig, network_i); gc()
 
+# Assemble stan data for second trial set (no AC, no epsilon)
+trial_1_data <- list(n_obs = nrow(biota_1_ct),                # no. samples
+                        n_pred = ncol(samples_u_full),             # no. predictors
+                        n_taxa = ncol(biota_1_ct),              # no. taxa
+                        n_site = max(site),                   # no. sites with a site upstream
+                        u = as.matrix(samples_u_full),             # predictor model matrix
+                        y = as.matrix(biota_1_ct),
+                        site = site,
+                        phylo_cor = spp_vcv_1)                    # Phylogenetic covariance       
 ```
 
 ### Run competing Stan models
@@ -680,99 +730,532 @@ ifqdtbrs_fi_qf_qd_phylo_ac_data <- list(n_obs = nrow(biota_ct),                #
 Start with simple minimum no predictors for comparison of models with and without a spatial autocorrelation effect, and with and without phylogenetic covariance
 
 ```{r}
+#| eval: false
+
 ifqrs_data <- ifqdtbrs_fi_qf_qd_phylo_ac_data 
 ifqrs_data$u <- ifqrs_data$u[,colnames(ifqrs_data$u) %in% c("I","F","Q","Q2","nriff","season_mod")]
 ifqrs_data$n_pred <- ncol(ifqrs_data$u)
+# save(ifqrs_data, file = "temp_data/ifqrs_data.rda")
 
-# ### with Euclidean autocorrelation and phylogenetic covariance
-# ifqrs_data_euc <- ifqrs_data[!names(ifqrs_data) %in% c("riv_dist_mat","is_downstream")]
-# ifqrs_data_euc$euc_dist_mat <- dist_euc_stand
-# mod_code <- "ifqrs_ac_euc"
-# model_fit <- rstan::stan(file = "~/git/mw_metabarcoding_model/stancode/multitaxon_pa_ac_euc.stan",
-#                          data = ifqrs_data_euc,
-#                          seed = proj_seed,
-#                          # save_warmup = TRUE,  # checked on first run: 500 warm-up plenty
-#                          chains = 1, cores = parallel::detectCores(),
-#                          warmup = 500,
-#                          iter = 10500) # 28 min for 2000 iterations
-# saveRDS(model_fit, file = paste0("~/uomShare/wergStaff/ChrisW/temp/model_",
-#                                   mod_code, ".rds")) 
+####  MODEL 1. with downstream AC and phylogenetic covariance
+####### FIRST RUN AT 4000 iterations. Need to repeat at 6000
+mod_code <- "ifqrs_ac_riv"
+mod <- cmdstan_model("stancode/jointspp_pa_ac_riv.stan")
+mod_dir <-paste0("~/uomShare/wergStaff/ChrisW/git-data/",
+              "mw_metabarcoding_model/trial_33spp_models/", mod_code)
+if (!dir.exists(mod_dir)) dir.create(mod_dir)
+model_fit <- mod$sample(data = ifqrs_data, seed = proj_seed,
+                        output_dir = mod_dir,
+                        chains = 4, parallel_chains = 4, 
+                        adapt_delta = 0.9, # required to remove <8 divergences
+                        iter_warmup = 500,  iter_sampling = 6000)  # 50 min + 5 to finish
+# copy the CSVs out of the temporary folder
+# model_fit$save_output_files(dir = mod_dir)
+# # extract the low RAM components
+diagnostic_summary  <- model_fit$diagnostic_summary()
+# save before compiling summary in case RAM overloaded by summary
+mod_bundle <- list(fit = model_fit, 
+                   diagnostics = diagnostic_summary)
+saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
+mod_summary <- model_fit$summary(variables = params_to_summarise); gc()
+# Find big objects to remove
+# sort(sapply(ls(), function(x) object.size(get(x)) / 1024^2), decreasing = TRUE)
+mod_loo <- model_fit$loo(variables = "log_lik", cores = 4); gc()
+# save only the metadata and paths, NOT the full draws
+# (fit still contains references to the new permanent CSV paths)
+mod_bundle <- list(fit = model_fit, 
+                   diagnostics = diagnostic_summary,
+                   summary = mod_summary,
+                   loo = mod_loo)
+saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
+rm(mod_bundle, model_fit, mod_summary, diagnostic_summary);  gc()
+
+### MODEL 1.1. with downstream autocorrelation and phylogenetic covariance, but EI transformed as log(x + 0.01)
+ifqrs_data_itom <- ifqrs_data
+ifqrs_data_itom$u[colnames(ifqrs_data$u) == "I"] <- I_tom_mod
+mod_code <- "ifqrs_ac_riv_itom"
+mod <- cmdstan_model("stancode/jointspp_pa_ac_riv.stan")
+mod_dir <-paste0("~/uomShare/wergStaff/ChrisW/git-data/",
+              "mw_metabarcoding_model/trial_33spp_models/", mod_code)
+if (!dir.exists(mod_dir)) dir.create(mod_dir)
+model_fit <- mod$sample(data = ifqrs_data_itom, seed = proj_seed,
+                        output_dir = mod_dir,
+                        chains = 4, parallel_chains = 4, 
+                        adapt_delta = 0.95, # required to remove <8 divergences
+                        iter_warmup = 500,  iter_sampling = 12000)  # 
+# copy the CSVs out of the temporary folder
+# model_fit$save_output_files(dir = mod_dir)
+# # extract the low RAM components
+diagnostic_summary  <- model_fit$diagnostic_summary()
+# save before compiling summary in case RAM overloaded by summary
+mod_bundle <- list(fit = model_fit, 
+                   diagnostics = diagnostic_summary)
+saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
+mod_summary <- model_fit$summary(variables = params_to_summarise); gc()
+mod_loo <- model_fit$loo(variables = "log_lik", cores = 4); gc()
+# save only the metadata and paths, NOT the full draws
+# (fit still contains references to the new permanent CSV paths)
+mod_bundle <- list(fit = model_fit, 
+                   diagnostics = diagnostic_summary,
+                   summary = mod_summary,
+                   loo = mod_loo)
+saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
+rm(mod_bundle, model_fit, mod_summary, diagnostic_summary);  gc()
+
+### MODEL 1.2. with downstream autocorrelation but no phylogenetic covariance
+ifqrs_ac_riv_no_phylo_data <- ifqrs_data
+# Remove phylogeny by making phylo_cor an identity matrix
+ifqrs_ac_riv_no_phylo_data$phylo_cor <- diag(ifqrs_data$n_taxa)
+mod_code <- "ifqrs_ac_riv_NO_phylo"
+mod <- cmdstan_model("stancode/jointspp_pa_ac_riv_NO_phylo.stan")
+mod_dir <-paste0("~/uomShare/wergStaff/ChrisW/git-data/",
+              "mw_metabarcoding_model/trial_33spp_models/", mod_code)
+if (!dir.exists(mod_dir)) dir.create(mod_dir)
+model_fit <- mod$sample(data = ifqrs_ac_riv_no_phylo_data, seed = proj_seed,
+                        output_dir = mod_dir,
+                        chains = 4, parallel_chains = 4, 
+                        adapt_delta = 0.95, # required to remove <8 divergences
+                        iter_warmup = 500,  iter_sampling = 7000)  # 
+# copy the CSVs out of the temporary folder
+# model_fit$save_output_files(dir = mod_dir)
+# # extract the low RAM components
+diagnostic_summary  <- model_fit$diagnostic_summary()
+# save before compiling summary in case RAM overloaded by summary
+mod_bundle <- list(fit = model_fit, 
+                   diagnostics = diagnostic_summary)
+saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
+mod_summary <- model_fit$summary(variables = params_to_summarise); gc()
+mod_loo <- model_fit$loo(variables = "log_lik", cores = 4); gc()
+# save only the metadata and paths, NOT the full draws
+# (fit still contains references to the new permanent CSV paths)
+mod_bundle <- list(fit = model_fit, 
+                   diagnostics = diagnostic_summary,
+                   summary = mod_summary,
+                   loo = mod_loo)
+saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
+rm(mod_bundle, model_fit, mod_summary, diagnostic_summary);  gc()
+
+### MODEL 1.3. with phylogenetic covariance but no autocorrelation
+ifqrs_no_ac_data <- ifqrs_data
+# Remove AC effects by making riv_dist_mat a matrix of zeroes and 
+# is_downstream an identity matrix
+ifqrs_no_ac_data$riv_dist_mat <- matrix(0, nrow = n_site, ncol = n_site)
+ifqrs_no_ac_data$is_downstream <- diag(n_site)
+mod_code <- "ifqrs_NO_ac"
+mod <- cmdstan_model("stancode/jointspp_pa.stan")
+mod_dir <-paste0("~/uomShare/wergStaff/ChrisW/git-data/",
+              "mw_metabarcoding_model/trial_33spp_models/", mod_code)
+if (!dir.exists(mod_dir)) dir.create(mod_dir)
+model_fit <- mod$sample(data = ifqrs_no_ac_data, seed = proj_seed,
+                        output_dir = mod_dir,
+                        chains = 4, parallel_chains = 4, 
+                        adapt_delta = 0.95, # required to remove <8 divergences
+                        iter_warmup = 500,  iter_sampling = 14000)  # 
+# copy the CSVs out of the temporary folder
+# model_fit$save_output_files(dir = mod_dir)
+# # extract the low RAM components
+diagnostic_summary  <- model_fit$diagnostic_summary()
+# save before compiling summary in case RAM overloaded by summary
+mod_bundle <- list(fit = model_fit, 
+                   diagnostics = diagnostic_summary)
+saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
+mod_summary <- model_fit$summary(variables = params_to_summarise); gc()
+mod_loo <- model_fit$loo(variables = "log_lik", cores = 4); gc()
+# save only the metadata and paths, NOT the full draws
+# (fit still contains references to the new permanent CSV paths)
+mod_bundle <- list(fit = model_fit, 
+                   diagnostics = diagnostic_summary,
+                   summary = mod_summary,
+                   loo = mod_loo)
+saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
+rm(mod_bundle, model_fit, mod_summary, diagnostic_summary);  gc()
 
 ```
 
+Calculations that needed to wait for a (moderately) large memory computer
+
 ```{r}
+#| eval: false
 
-# ### with Euclidean autocorrelation and phylogenetic covariance
-# ifqrs_data_euc <- ifqrs_data[!names(ifqrs_data) %in% c("riv_dist_mat","is_downstream")]
-# ifqrs_data_euc$euc_dist_mat <- dist_euc_stand
-# mod_code <- "ifqrs_ac_euc"
-# model_fit <- rstan::stan(file = "~/git/mw_metabarcoding_model/stancode/multitaxon_pa_ac_euc.stan",
-#                          data = ifqrs_data_euc,
-#                          seed = proj_seed,
-#                          save_warmup = TRUE,
-#                          chains = 1, cores = parallel::detectCores(),
-#                          warmup = 500,
-#                          iter = 1500) # 28 min min Bulk ESS 15, so need 6000?
-# saveRDS(model_fit, file = paste0("~/uomShare/wergStaff/ChrisW/temp/model_",
-#                                   mod_code, ".rds")) 
-# 
-# ### with downstream autocorrelation and phylogenetic covariance, but EI transformed as log(x + 0.01)
-# ifqrs_data_itom <- ifqrs_data
-# ifqrs_data_itom$u[colnames(ifqrs_data$u) == "I"] <- I_tom_mod
-# mod_code <- "ifqrs_ac_riv_itom"
-# model_fit <- rstan::stan(file = "~/git/mw_metabarcoding_model/stancode/multitaxon_pa_ac_riv.stan",
-#                          data = ifqrs_data_itom,
-#                          seed = proj_seed,
-#                          chains = 1, cores = parallel::detectCores(),
-#                          warmup = 500,
-#                          iter = 5500) # 56 min, Bulk ESS too low?
-# saveRDS(model_fit, file = paste0("~/uomShare/wergStaff/ChrisW/temp/model_",
-#                                   mod_code, ".rds")) 
-# 
-# ### with downstream autocorrelation but no phylogenetic covariance
-# mod_code <- "ifqrs_ac_riv_NO_phylo"
-# model_fit <- rstan::stan(file = "~/git/mw_metabarcoding_model/stancode/multitaxon_pa_ac_riv_NO_phylo.stan",
-#                          data = ifqrs_data,
-#                          seed = proj_seed,
-#                          chains = 1, cores = parallel::detectCores(),
-#                          warmup = 500,
-#                          iter = 5500)  # 46 min, 1 divergence 
-# saveRDS(model_fit, file = paste0("~/uomShare/wergStaff/ChrisW/temp/model_",
-#                                   mod_code, ".rds"))
-# 
-# ### with phylogenetic covariance but no autocorrelation
-# mod_code <- "ifqrs_NO_ac"
-# model_fit <- rstan::stan(file = "~/git/mw_metabarcoding_model/stancode/multitaxon_pa_NO_ac.stan",
-#                          data = ifqrs_data,
-#                          seed = proj_seed,
-#                          chains = 1, cores = parallel::detectCores(),
-#                          warmup = 500,
-#                          iter = 5500) # 1 h, 8 divergences, min Tail ESS 78. 
-#                                       # Leave as is for now after adjusting priors and correcting the phylo step
-# saveRDS(model_fit, file = paste0("~/uomShare/wergStaff/ChrisW/temp/model_",
-#                                   mod_code, ".rds"))  
-# 
-### with downstream AC and phylogenetic covariance
-mod_code <- "ifqrs_ac_riv"
-model_fit <- rstan::stan(file = "~/git/mw_metabarcoding_model/stancode/multitaxon_pa_ac_riv.stan",
-                         data = ifqrs_data,
-                         # save_warmup = TRUE, # inspection of first run showed 500 is plenty
-                         seed = proj_seed,
-                         chains = 4, cores = 4,
-                         warmup = 500,
-                         iter = 2500) # ~ 1 h for 4500, but it exceeded 64 G RAM
-saveRDS(model_fit, file =  paste0("~/uomShare/wergStaff/ChrisW/temp/model_",
-                                  mod_code, ".rds")) 
+# Summarize only the parameters of interest (not intermediate 'maths-tricks')
+params_to_summarise <- c(
+  "mu_beta", "scale_beta", "beta",  # Fixed effects
+  "sigma_epsilon",                  # Overdispersion variance (and usually the least well sampled)
+  "sigma_site",                     # Site variance
+  "mu_taxon", "sigma_taxon",        # Taxon hyper-parameters
+  "rho_space", "sigma_space",       # Spatial parameters
+  "a_taxon", "a_site", "delta",     # Structural random effects
+  "tjurs_r2",                       # Explanatory power
+  "y_rep"                           # For your observed vs predicted plots
+) # to reduce the RAM required to build the summary table
 
+# First discovery with 488 G RAM was that to calculate loo_mm, you need to have commpiled
+# the model using compile_model_methods first.  I don't think it is worth re-doing 
+# the itom, no_phylo, and no_AC models for that purpose, as the loo comparison is
+# not so critical (Their comparisons are primarily to confirm the sense of modelling 
+# decisions made, and loo without mm is sufficient for that).  
+# I will start by re-running ifqrs_ac_riv as this will be used in more serious comparisons
+# down the track.
+
+####  MODEL 1. 5 base fixed predictors, with downstream AC and phylogenetic covariance (re-run with 6000 iterations)
+mod_code <- "ifqrs_ac_riv_6000"
+mod <- cmdstan_model(stan_file = "stancode/jointspp_pa_ac_riv.stan",
+                     compile_model_methods = TRUE) #, # always run this if cross-validation is planned (memory intensive)
+                  #   force_recompile = TRUE )
+mod_dir <-paste0("~/uomShare/wergStaff/ChrisW/git-data/",
+              "mw_metabarcoding_model/trial_33spp_models/", mod_code)
+if (!dir.exists(mod_dir)) dir.create(mod_dir)
+model_fit <- mod$sample(data = ifqrs_data, seed = proj_seed,
+                        output_dir = mod_dir,
+                        chains = 4, parallel_chains = 4, 
+                        adapt_delta = 0.9, # required to remove <8 divergences
+                        iter_warmup = 500,  iter_sampling = 6000)  # 50 min + 5 to finish
+diagnostic_summary  <- model_fit$diagnostic_summary()
+mod_bundle <- list(fit = model_fit, 
+                   diagnostics = diagnostic_summary)
+saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
+mod_summary <- model_fit$summary(variables = params_to_summarise); gc()
+mod_bundle$summary <- mod_summary
+saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
+mod_loo <- model_fit$loo(variables = "log_lik", cores = 4); gc() # needed 67 G RAM
+mod_bundle$loo <- mod_loo
+saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
+# model_fit$init_model_methods()
+# mod_loo_mm <- model_fit$loo(variables = "log_lik", moment_match = TRUE, cores = 4); qc()
+# # This very nearly maxed out 488 G RAM. and too 8 hours without finishing. Definitely postpone this!
+# mod_bundle$loo_mm <- mod_loo_mm
+# saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
+# rm(mod_bundle, model_fit, mod_summary, diagnostic_summary);  gc()
+
+#### MODEL 2. all 8 fixed predictors (no interactions), with downstream AC and phylogenetic covariance
+ifqdtbrs_data <- ifqdtbrs_fi_qf_qd_phylo_ac_data
+ifqdtbrs_data$u <- ifqdtbrs_data$u[,colnames(ifqdtbrs_data$u) %in% c("I","F","Q","Q2","D","T","B","nriff","season_mod")]
+ifqdtbrs_data$n_pred <- ncol(ifqdtbrs_data$u)
+mod_code <- "ifqdtbrs_ac_riv"
+mod_dir <-paste0("~/uomShare/wergStaff/ChrisW/git-data/",
+              "mw_metabarcoding_model/trial_33spp_models/", mod_code)
+if (!dir.exists(mod_dir)) dir.create(mod_dir)
+model_fit <- mod$sample(data = ifqdtbrs_data, seed = proj_seed,
+                        output_dir = mod_dir,
+                        chains = 4, parallel_chains = 4, 
+                        adapt_delta = 0.9, 
+                        iter_warmup = 500,  iter_sampling = 6000)  
+diagnostic_summary  <- model_fit$diagnostic_summary()
+mod_bundle <- list(fit = model_fit, 
+                   diagnostics = diagnostic_summary)
+saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
+mod_summary <- model_fit$summary(variables = params_to_summarise); gc()
+mod_bundle$summary <- mod_summary
+saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
+mod_loo <- model_fit$loo(variables = "log_lik", cores = 4); gc() # needed 67 G RAM
+mod_bundle$loo <- mod_loo
+saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
+# model_fit$init_model_methods()
+## Let's try 4 cores and time it.
+# mod_loo_mm <- model_fit$loo(variables = "log_lik", moment_match = TRUE, cores = 4); qc()
+# mod_bundle$loo_mm <- mod_loo_mm
+# saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
+rm(mod_bundle, model_fit, mod_summary, diagnostic_summary);  gc()
+
+#### MODEL 4. 8 fixed predictors  and 3 primary interactions, with downstream AC and phylogenetic covariance
+####          (Despite the mode_code, the 3 interactions are FI, QF and QI)
+mod_code <- "ifqdtbrs_fi_qf_qd_ac_riv"
+mod_dir <-paste0("~/uomShare/wergStaff/ChrisW/git-data/",
+              "mw_metabarcoding_model/trial_33spp_models/", mod_code)
+if (!dir.exists(mod_dir)) dir.create(mod_dir)
+model_fit <- mod$sample(data = ifqdtbrs_fi_qf_qd_phylo_ac_data, seed = proj_seed,
+                        output_dir = mod_dir,
+                        chains = 4, parallel_chains = 4, 
+                        adapt_delta = 0.9, 
+                        iter_warmup = 500,  iter_sampling = 6000)  
+diagnostic_summary  <- model_fit$diagnostic_summary()
+mod_bundle <- list(fit = model_fit, 
+                   diagnostics = diagnostic_summary)
+saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
+mod_summary <- model_fit$summary(variables = params_to_summarise); gc()
+mod_bundle$summary <- mod_summary
+saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
+mod_loo <- model_fit$loo(variables = "log_lik", cores = 4); gc() # needed 67 G RAM
+mod_bundle$loo <- mod_loo
+saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
+# model_fit$init_model_methods()
+# mod_loo_mm <- model_fit$loo(variables = "log_lik", moment_match = TRUE, cores = 2); qc()
+# mod_bundle$loo_mm <- mod_loo_mm
+# saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
+#rm(mod_bundle, model_fit, mod_summary, diagnostic_summary);  gc()
+
+#### MODEL 3. 7 fixed predictors (no interactions, No Basalt), with downstream AC and phylogenetic covariance
+ifqdtrs_data <- ifqdtbrs_fi_qf_qd_phylo_ac_data 
+ifqdtrs_data$u <- ifqdtbrs_data$u[,colnames(ifqdtbrs_data$u) %in% c("I","F","Q","Q2","D","T","nriff","season_mod")]
+ifqdtrs_data$n_pred <- ncol(ifqdtrs_data$u)
+mod_code <- "ifqdtrs_ac_riv"
+mod_dir <-paste0("~/uomShare/wergStaff/ChrisW/git-data/",
+              "mw_metabarcoding_model/trial_33spp_models/", mod_code)
+if (!dir.exists(mod_dir)) dir.create(mod_dir)
+model_fit <- mod$sample(data = ifqdtrs_data, seed = proj_seed,
+                        output_dir = mod_dir,
+                        chains = 4, parallel_chains = 4, 
+                        adapt_delta = 0.9, 
+                        iter_warmup = 500,  iter_sampling = 6000)  
+diagnostic_summary  <- model_fit$diagnostic_summary()
+mod_bundle <- list(fit = model_fit, 
+                   diagnostics = diagnostic_summary)
+saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
+mod_summary <- model_fit$summary(variables = params_to_summarise); gc()
+mod_bundle$summary <- mod_summary
+saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
+mod_loo <- model_fit$loo(variables = "log_lik", cores = 4); gc() # needed 67 G RAM
+mod_bundle$loo <- mod_loo
+saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
+# model_fit$init_model_methods()
+# mod_loo_mm <- model_fit$loo(variables = "log_lik", moment_match = TRUE, cores = 2); qc()
+# mod_bundle$loo_mm <- mod_loo_mm
+# saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
+rm(mod_bundle, model_fit, mod_summary, diagnostic_summary);  gc()
+
+#### MODEL 1.4 with Euclidean autocorrelation and phylogenetic covariance, but EI transformed as log(x + 0.01)
+ 
+ifqrs_data_euc <- ifqrs_data[!names(ifqrs_data) %in% c("riv_dist_mat","is_downstream")]
+ifqrs_data_euc$euc_dist_mat <- dist_euc_stand
+mod_code <- "ifqrs_ac_euc"
+mod <- cmdstan_model(stan_file = "stancode/jointspp_pa_ac_euc.stan",
+#                     compile_model_methods = TRUE, # not worth running for this one - 
+                                      # less important comparison with other model 1s
+                     force_recompile = TRUE )
+mod_dir <-paste0("~/uomShare/wergStaff/ChrisW/git-data/",
+              "mw_metabarcoding_model/trial_33spp_models/", mod_code)
+if (!dir.exists(mod_dir)) dir.create(mod_dir)
+model_fit <- mod$sample(data = ifqrs_data_euc, seed = proj_seed,
+                        output_dir = mod_dir,
+                        chains = 4, parallel_chains = 4, 
+                        adapt_delta = 0.95, # required to remove <8 divergences
+                        iter_warmup = 500,  iter_sampling = 10000)  # 
+# copy the CSVs out of the temporary folder
+# model_fit$save_output_files(dir = mod_dir)
+# # extract the low RAM components
+diagnostic_summary  <- model_fit$diagnostic_summary()
+# save before compiling summary in case RAM overloaded by summary
+mod_bundle <- list(fit = model_fit, 
+                   diagnostics = diagnostic_summary)
+saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
+mod_summary <- model_fit$summary(variables = params_to_summarise); gc()
+saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
+mod_loo <- model_fit$loo(variables = "log_lik", cores = 4); gc()
+# save only the metadata and paths, NOT the full draws
+# (fit still contains references to the new permanent CSV paths)
+mod_bundle <- list(fit = model_fit, 
+                   diagnostics = diagnostic_summary,
+                   summary = mod_summary,
+                   loo = mod_loo)
+saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
+rm(mod_bundle, model_fit, mod_summary, diagnostic_summary);  gc()
+
+# Failed to complete before the big-memory booking expired. 
+# I used this to find the minimum number of samples taken in the 4 chains.
+# In terminal having cd-ed to mod_dir
+# grep -v '^#' *.csv | cut -d: -f1 | uniq -c
+# lengths were 10000, 7182, 10000, 7150.  
+csv_files <- paste0(mod_dir, "/", dir(mod_dir))
+fit <- cmdstanr::read_cmdstan_csv(csv_files)
+
+#### FIRST TRIAL of the full model
+
+load("~/uomShare/wergStaff/ChrisW/temp/ifqdtbrs_fi_qf_qd_phylo_ac_881spp_data.rda")
+ifqdtbrs_fi_qf_qd_phylo_ac_881spp_data
+ifqdtbrs_fi_qf_qd_phylo_ac_881spp_data$save_y_rep <- 0
+mod_code <- "ifqrs_ac_riv_reduce_sum"
+mod_dir <-paste0("~/uomShare/wergStaff/ChrisW/git-data/",
+              "mw_metabarcoding_model/trial_33spp_models/", mod_code)
+if (!dir.exists(mod_dir)) dir.create(mod_dir)
+# 1. Compile with the correct lowercase option (no force_recompile needed if already done)
+mod_parallel <- cmdstan_model(
+  "stancode/jointspp_pa_ac_riv_parallelized.stan", 
+  cpp_options = list(stan_threads = TRUE),
+  force_recompile = TRUE
+)
+# 2. Set the environment pool high enough to allow the threads to spawn
+Sys.setenv(STAN_NUM_THREADS = "4")  # was 16 for full run (and below it was 4, 4, and 4)
+# 3. Launch the test with plenty of core headroom
+model_fit <- mod_parallel$sample(
+  data = ifqdtbrs_fi_qf_qd_phylo_ac_881spp_data, 
+  seed = proj_seed,
+  chains = 1,             
+  parallel_chains = 1,    
+  threads_per_chain = 4,  
+  adapt_delta = 0.9, 
+  iter_warmup = 500,  
+  iter_sampling = 1000,
+  save_warmup = FALSE
+)
+saveRDS(model_fit, file = paste0(mod_dir, "/", mod_code, "model_fit.rds"))
+
+```
+
+And then back with 64 G RAM
+
+```{r}
+#| eval: false
+#| 
+params_to_summarise <- c(
+  "mu_beta", "scale_beta", "beta",  # Fixed effects
+  "sigma_epsilon",                  # Overdispersion variance (and usually the least well sampled)
+  "sigma_site",                     # Site variance
+  "mu_taxon", "sigma_taxon",        # Taxon hyper-parameters
+  "a_taxon", "a_site",     # Structural random effects
+  "tjurs_r2",                       # Explanatory power
+  "y_rep"                           # For your observed vs predicted plots
+) # to reduce the RAM required to build the summary table
+
+
+### MODEL 4.3. ifqdtbrs_fi_qf_qd with no autocorrelation
+ifqdtbrs_fi_qf_qd_no_ac_data <- ifqdtbrs_fi_qf_qd_phylo_ac_data
+# Remove AC effects by making riv_dist_mat a matrix of zeroes and 
+# is_downstream an identity matrix
+n_site <- ifqdtbrs_fi_qf_qd_no_ac_data$n_site
+ifqdtbrs_fi_qf_qd_no_ac_data$riv_dist_mat <- matrix(0, nrow = n_site, ncol = n_site)
+ifqdtbrs_fi_qf_qd_no_ac_data$is_downstream <- diag(n_site)
+mod_code <- "ifqdtbrs_fi_qf_qd_NO_ac_6000"
+mod <- cmdstan_model(stan_file = "stancode/jointspp_pa.stan",
+                     compile_model_methods = TRUE) #, 
+                  #   force_recompile = TRUE )
+mod_dir <-paste0("~/uomShare/wergStaff/ChrisW/git-data/",
+              "mw_metabarcoding_model/trial_33spp_models/", mod_code)
+if (!dir.exists(mod_dir)) dir.create(mod_dir)
+model_fit <- mod$sample(data = ifqdtbrs_fi_qf_qd_phylo_ac_data, seed = proj_seed,
+                        output_dir = mod_dir,
+                        chains = 4, parallel_chains = 4, 
+                        adapt_delta = 0.9, 
+                        iter_warmup = 500,  iter_sampling = 6000)  
+diagnostic_summary  <- model_fit$diagnostic_summary()
+mod_bundle <- list(fit = model_fit, 
+                   diagnostics = diagnostic_summary)
+saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
+mod_summary <- model_fit$summary(variables = params_to_summarise); gc()
+mod_bundle$summary <- mod_summary
+saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
+mod_loo <- model_fit$loo(variables = "log_lik", cores = 4); gc() # needed 67 G RAM
+mod_bundle$loo <- mod_loo
+saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
+
+### MODEL 4.4. ifqdtbrs_fi_qf_qd with no autocorrelation and no epsilon
+params_to_summarise <- c(
+  "mu_beta", "scale_beta", "beta",  # Fixed effects
+  "sigma_site",                     # Site variance
+  "mu_taxon", "sigma_taxon",        # Taxon hyper-parameters
+  "a_taxon", "a_site",     # Structural random effects
+  "tjurs_r2",                       # Explanatory power
+  "y_rep"                           # For your observed vs predicted plots
+) # to reduce the RAM required to build the summary table
+
+ifqdtbrs_fi_qf_qd_no_ac_data <- ifqdtbrs_fi_qf_qd_phylo_ac_data
+# Remove AC effects by making riv_dist_mat a matrix of zeroes and 
+# is_downstream an identity matrix
+n_site <- ifqdtbrs_fi_qf_qd_no_ac_data$n_site
+ifqdtbrs_fi_qf_qd_no_ac_data$riv_dist_mat <- matrix(0, nrow = n_site, ncol = n_site)
+ifqdtbrs_fi_qf_qd_no_ac_data$is_downstream <- diag(n_site)
+mod_code <- "ifqdtbrs_fi_qf_qd_NO_ac_NO_eps_6000"
+mod <- cmdstan_model(stan_file = "stancode/jointspp_pa_NO_eps.stan",
+                     compile_model_methods = TRUE) #, 
+                  #   force_recompile = TRUE )
+mod_dir <-paste0("~/uomShare/wergStaff/ChrisW/git-data/",
+              "mw_metabarcoding_model/trial_33spp_models/", mod_code)
+if (!dir.exists(mod_dir)) dir.create(mod_dir)
+model_fit <- mod$sample(data = ifqdtbrs_fi_qf_qd_phylo_ac_data, seed = proj_seed,
+                        output_dir = mod_dir,
+                        chains = 4, parallel_chains = 4, 
+                        adapt_delta = 0.9, 
+                        iter_warmup = 500,  iter_sampling = 6000)  
+diagnostic_summary  <- model_fit$diagnostic_summary()
+mod_bundle <- list(fit = model_fit, 
+                   diagnostics = diagnostic_summary)
+saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
+mod_summary <- model_fit$summary(variables = params_to_summarise); gc()
+mod_bundle$summary <- mod_summary
+saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
+mod_loo <- model_fit$loo(variables = "log_lik", cores = 4); gc() # needed 67 G RAM
+mod_bundle$loo <- mod_loo
+saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
+
+```
+
+### Model selection with trial subset 1
+
+With 190 species (all prevalent species and 90 less prevalent species, many congenerics), compare models without AC and epsilon to permit rapid model sampling
+
+
+```{r}
+params_to_summarise <- c(
+  "mu_beta", "scale_beta", "beta",  # Fixed effects
+  "sigma_site",                     # Site variance
+  "mu_taxon", "sigma_taxon",        # Taxon hyper-parameters
+  "a_taxon", "a_site",     # Structural random effects
+  "tjurs_r2",                       # Explanatory power
+  "y_rep"                           # For your observed vs predicted plots
+) # to reduce the RAM required to build the summary table
+
+mod_code <- "ifqdtblrs_fi_qf_qd"
+mod <- cmdstan_model(stan_file = "stancode/jointspp_pa_NO_eps.stan",
+                     compile_model_methods = TRUE) #, 
+                  #   force_recompile = TRUE )
+mod_dir <-paste0("~/uomShare/wergStaff/ChrisW/git-data/",
+              "mw_metabarcoding_model/trial_190spp_models/", mod_code)
+if (!dir.exists(mod_dir)) dir.create(mod_dir)
+model_fit <- mod$sample(data = trial_1_data, seed = proj_seed,
+                        output_dir = mod_dir,
+                        chains = 4, parallel_chains = 4, 
+                        adapt_delta = 0.95, 
+                        iter_warmup = 500,  iter_sampling = 1500)  
+diagnostic_summary  <- model_fit$diagnostic_summary()
+mod_bundle <- list(fit = model_fit, 
+                   diagnostics = diagnostic_summary)
+saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
+mod_summary <- model_fit$summary(variables = params_to_summarise); gc()
+mod_bundle$summary <- mod_summary
+saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
+mod_loo <- model_fit$loo(variables = "log_lik", cores = 4); gc() # needed 67 G RAM
+mod_bundle$loo <- mod_loo
+saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
+
+# max_tree_depth exceeded, 2.5 h to run, and min bulk ESS 104. 
+# Try with epsilon back in - no divergences, so drop adapt_delta back to 0.9
+
+params_to_summarise <- c(params_to_summarise, "sigma_epsilon")
+mod_code <- "ifqdtblrs_fi_qf_qd_eps"
+mod <- cmdstan_model(stan_file = "stancode/jointspp_pa.stan",
+                     compile_model_methods = TRUE) #, 
+                  #   force_recompile = TRUE )
+mod_dir <-paste0("~/uomShare/wergStaff/ChrisW/git-data/",
+              "mw_metabarcoding_model/trial_190spp_models/", mod_code)
+if (!dir.exists(mod_dir)) dir.create(mod_dir)
+model_fit <- mod$sample(data = trial_1_data, seed = proj_seed,
+                        output_dir = mod_dir,
+                        chains = 4, parallel_chains = 4, 
+                        adapt_delta = 0.9, 
+                        iter_warmup = 500,  iter_sampling = 1500)  
+diagnostic_summary  <- model_fit$diagnostic_summary()
+mod_bundle <- list(fit = model_fit, 
+                   diagnostics = diagnostic_summary)
+saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
+mod_summary <- model_fit$summary(variables = params_to_summarise); gc()
+mod_bundle$summary <- mod_summary
+saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
+mod_loo <- model_fit$loo(variables = "log_lik", cores = 4); gc() # needed 67 G RAM
+mod_bundle$loo <- mod_loo
+saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
+
+
+```
+
+
+
+
+```{r}
 ###
 # saveRDS(model_fit, file = "~/uomShare/wergStaff/ChrisW/temp/model_ifqcdtbrs_fi_qf_qi_ac_riv.rds") 
 # ifqdtbrs_fi_qf_qd_ac with incorrect AC code (i.e. no ac modelled) saved as ifqdtbrs_fi_qf_qd_ac_riv.rda
 # 500 & 3200 with warmup saved for model_ifqdtbrs_fi_qf_qd_ac_riv.rds 
 # 500 & 10000 with warmup saved  for model_ifqcdtbrs_ac_riv.rds (6h)
 
-```
-
-```{r}
 rstan::stan_trace(model_fit, "rho_space", inc_warmup = TRUE)  #, "alpha"
 rstan::stan_trace(model_fit, "lp__", inc_warmup = TRUE)  #, "alpha"
 # This suggests a warmup of 500 iterations is sufficient: but 100 post-warmup produced only 32 bulk ESS (46 tail)

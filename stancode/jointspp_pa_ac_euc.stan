@@ -107,7 +107,7 @@ model {
   // --- Spatial Priors ---
   to_vector(delta_raw) ~ std_normal();
   sigma_space ~ normal(0, 0.5);
-  rho_space ~ lognormal(-1, 0.5); // Prior concentrated on the 0-1 scaled distance range
+  rho_space ~ inv_gamma(2, 0.5); // Prior concentrated on the 0-1 scaled distance range
 
   // --- Genuine Random Effects Priors ---
   // mu_site ~ normal(0, 5);    //removed above             
@@ -131,17 +131,13 @@ model {
 
 generated quantities {
   array[n_obs, n_taxa] int<lower=0, upper=1> y_rep; // Simulated replica data
-  vector[n_site] log_lik; // vector of length n_site for site-level LOO-CV                         
+  vector[n_obs * n_taxa] log_lik;                  // Flattened observation-by-taxon log-likelihood
   vector[n_taxa] tjurs_r2;                         // Explanatory power per taxon
  
-  // Initialize log_lik vector to 0
-  for (s in 1:n_site) {
-    log_lik[s] = 0.0;
-  }
-  
-    {
-  // Temporary tracking vectors to calculate Tjur's R2 per taxon
-  for (j in 1:n_taxa) {
+  {
+    int idx = 1; // Counter to flatten the log_lik vector
+    
+    for (j in 1:n_taxa) {
       real sum_prob_pres = 0.0;
       real sum_prob_abs = 0.0;
       real n_pres = 0.0;
@@ -149,10 +145,15 @@ generated quantities {
       
       for (i in 1:n_obs) {
         real prob = inv_logit(mu[i, j]);
-        y_rep[i, j] = bernoulli_rng(prob); // Generate posterior predictive data
-        // Accumulate log-likelihood into the site index (sum all taxa (j) and all observations (i) belonging to each site)
-        log_lik[site[i]] += bernoulli_logit_lpmf(y[i, j] | mu[i, j]);
-        // Track values for Tjur's R2 calculation
+        
+        // 1. Generate posterior predictive data
+        y_rep[i, j] = bernoulli_rng(prob); 
+        
+        // 2. Calculate point-level log-likelihood (Observation x Taxon)
+        log_lik[idx] = bernoulli_logit_lpmf(y[i, j] | mu[i, j]);
+        idx += 1;
+        
+        // 3. Track values for Tjur's R2 calculation
         if (y[i, j] == 1) {
           sum_prob_pres += prob;
           n_pres += 1.0;
@@ -161,6 +162,8 @@ generated quantities {
           n_abs += 1.0;
         }
       }
+      
+      // Calculate final Tjur's R2 for the taxon
       if (n_pres > 0 && n_abs > 0) {
         tjurs_r2[j] = (sum_prob_pres / n_pres) - (sum_prob_abs / n_abs);
       } else {
@@ -169,4 +172,3 @@ generated quantities {
     }
   }
 }
-
