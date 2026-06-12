@@ -1,0 +1,746 @@
+---
+title: "Preliminary comparison of MW metabarcoding models"
+format: docx
+editor: source
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r}
+#| label: setup
+#| echo: false
+#| 
+library(knitr)     # Required for kable() markdown formatting
+
+suppressPackageStartupMessages(library(cmdstanr))
+suppressPackageStartupMessages(library(posterior))
+suppressPackageStartupMessages(library(data.table))
+
+# model data
+load("~/uomShare/wergStaff/ChrisW/temp/model_allvars_data.rda")
+# species names 
+mwbugs <- DBI::dbConnect(RPostgres::Postgres(), dbname = "mwbugs")
+taxon_all <- DBI::dbReadTable(mwbugs, "taxon_all")
+species <- data.frame(species_no = 1:ncol(biota_ct), 
+                species = taxon_all$taxon[match(names(as.data.frame(biota_ct)), 
+                                                taxon_all$shortcode)])
+
+mwstr <- DBI::dbConnect(RPostgres::Postgres(), dbname = "mwstr")
+
+# predictor_scales
+pred_labels <- c("I","F","Q","Q2","C","T","D","B","nriff","season","I*F","I*Q","F*Q")
+preds <- c("I","F","Q","Q2","C","T","D","B","nriff","season","F_I","Q_I","Q_F")
+scales <- data.frame(pred = preds, center = NA, scale = NA)
+for(i in 1:length(preds)){
+  if(!preds[i] %in% c("nriff","season")){
+  scales$scale[i] <- attr(get(preds[i]), "scaled:scale")
+  scales$center[i] <- attr(get(preds[i]), "scaled:center")
+  }
+  }
+
+# ultimately from cmdstanr_functions.R
+
+ft_to_word <- function(ft, pgwidth = 7){
+  # Set as autofit to make width parameters adjustable
+  ft_out <- flextable::autofit(ft)
+  # Set width as function of page width
+  ft_out <- flextable::width(ft_out, width = dim(ft_out)$widths*pgwidth /(flextable::flextable_dim(ft_out)$widths))
+  return(ft_out)
+}
+
+load_model_component_bundle <- function(mod_code, 
+      mod_dir = paste0("~/uomShare/wergStaff/ChrisW/git-data/",
+                   "mw_metabarcoding_model/trial_33spp_models/")){
+  mod_dir <-paste0(mod_dir, mod_code)
+  mod_files <- paste0(mod_dir, "/", dir(mod_dir))
+  mod_files <- mod_files[grepl(".csv", mod_files)]
+  mod_bundle <- readRDS(paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
+  mod_bundle
+}
+
+compile_model_diagnostics <- function(mod_code, 
+      mod_dir = paste0("~/uomShare/wergStaff/ChrisW/git-data/",
+                   "mw_metabarcoding_model/trial_33spp_models/")){
+  mod_path <-paste0(mod_dir, mod_code)
+  mod_files <- paste0(mod_path, "/", dir(mod_path))
+  mod_files <- mod_files[grepl(".csv", mod_files)]
+  mod_bundle <- load_model_component_bundle(mod_code, mod_dir)
+  diagnostic_summary <- mod_bundle$diagnostics
+  out_tab <- data.frame(spec = NA, value = NA)[0,]
+  ## Metadata
+  metadata <- suppressWarnings(data.table::fread(
+    cmd = paste("head -n 50", shQuote(path.expand(mod_files[1])))))
+  out_tab <- rbind(out_tab, data.frame(spec = metadata$V2, value = metadata$V4))
+  # Number of iterations
+  cmd <- "grep"; args <- c("-vc", "^#", mod_files[1])
+  output_string <- system2(cmd, args, stdout = TRUE)
+  out_tab <- rbind(out_tab, 
+                   data.frame(spec = c("No. iterations per chain", "No. chains"),
+                              value = c(round(as.numeric(output_string),-2),
+                                        length(mod_files))))
+  ## Time taken
+  t_taken <- vector("numeric")
+  for(i in 1:length(mod_files)){
+  time_taken_i <- suppressWarnings(data.table::fread(
+                 cmd = paste("tail -n 15", shQuote(path.expand(mod_files[i]))),
+                  skip = "#" ))
+  time_taken_i <- time_taken_i[!is.na(time_taken_i$Elapsed),]
+  t_taken <- c(t_taken, as.numeric(tail(time_taken_i$Elapsed,1))/60) # time taken in minutes
+  }
+  t_tab <- data.frame(spec = "Modelling time (min)", value = round(max(t_taken)))
+  out_tab <- rbind(out_tab, t_tab)
+  # stan diagnostics
+  s_tab <- data.frame(spec = c("No. divergences", "No. exceeding max_treedepth",
+                               "BFMI (chain 1)","BFMI (chain 1)",
+                               "BFMI (chain 3)","BFMI (chain 4)"),
+            value = c(sum(diagnostic_summary$num_divergent),
+                      sum(diagnostic_summary$num_max_treedepth),
+                      round(diagnostic_summary$ebfmi,2)))
+  out_tab <- rbind(out_tab, s_tab)
+  # ESS
+  if("summary" %in% names(mod_bundle)){
+  mod_summary <- mod_bundle$summary
+  s_tab1 <- data.frame(spec = c("Min. Bulk ESS","Min. Tail ESS",
+                                "Least well-sampled parameter"),
+            value = c(round(min(mod_summary$ess_bulk, na.rm = TRUE)),
+                      round(min(mod_summary$ess_tail, na.rm = TRUE)),
+                      mod_summary$variable[
+  which(mod_summary$ess_bulk == min(mod_summary$ess_bulk, na.rm = TRUE))]))
+  out_tab <- rbind(out_tab, s_tab1)
+  }
+  out_tab
+  }
+
+```
+
+## Introduction
+
+The parameterization and data structure of the hierarchical model of species distribution among 223 sites sampled during the metabarcoding study varied as it was developed. This document aims to assess change in model performance with the addition/removal of two primary model elements:
+
+- a spatial autocorrelation (AC) effect (either Euclidean distance or downstream river distance)
+
+- a phylogenetic covariance matrix (Phylo) to aid modelling of correlation of predictor variables among taxa
+
+It also aims to assess the difference in model performance using two transformations of effective imperviousness: log(x + 0.01) used by Tom during his model development, and log(x + 0.001) used in previous studies.
+
+To make these comparisons, I ran five versions of a model that uses the 5 most important fixed predictors that should be included in any potentially more complex models:
+
+- I, effective imperviousness;
+
+- F, attenuated forest cover;
+
+- Q, mean annual runoff depth mm (modelled for potential model responses as Q + Q^2^;
+
+- nriff, number of riffle samples making up the combined sample pair (0 or 1);
+
+- season, 0 for autumn, 1 for spring samples.
+
+The five models with these 5 base fixed predictors were:
+
+ - "d/s AC + Phylo": A downstream river distance AC term, and Phylo contributing to covariance among species; 
+ 
+ - "d/s AC + Phylo, alt EI": As above, but the I term calculated as log(EI + 0.01) rather than the standard log(EI + 0.001);
+ 
+ - "d/s AC only": As for "d/s AC + Phylo", but without a Phylo matrix;
+ 
+ - "Phylo only": As for "d/s AC + Phylo", but without an AC term;
+ 
+ - "Euc AC + Phylo": A Euclidean distance AC term, and Phylo contributing to covariance among species. This model sampled successfully, but minimum effective sample size from 1000 iterations was <10 for the spatial autocorrelation parameters. Larger sampling runs required more memory than available. A Euclidean distance model might be more tractable if distant sites are masked in a similar way to the masking used in downstream spatial autocorrelation model. The Euclidean distance model is not considered further at this stage.
+ 
+ I further compared several "d/s AC + Phylo" models with different combinations of fixed predictors:
+ 
+ - I, F, Q, nriff and season, as above;
+ 
+ - I, F, Q, catchment area (C), mean air temperature (T), Degree of regulation (D), nriff and season; 
+
+ - I, F, Q, C, T, D, proportion of catchment with basalt geology (B), nriff and season; 
+ 
+ - I, F, Q, C, T, D, B, nriff, season, and three primary expected potential interactions: I*F, I*Q, and F*Q.
+
+## Model compilation
+
+All models were built using the common specifications listed in @tbl-common_specs.
+
+```{r}
+#| echo: false
+#| label: tbl-common_specs
+#| tbl-cap: "Common specifications for all models described here."
+ 
+# ifqrs_ac_riv_diagnostics <- compile_model_diagnostics("ifqrs_ac_riv_6000")
+# ifqrs_ac_riv_itom_diagnostics <- compile_model_diagnostics("ifqrs_ac_riv_itom")
+# ifqrs_ac_riv_no_phylo_diagnostics <- compile_model_diagnostics("ifqrs_ac_riv_NO_phylo")
+# ifqrs_no_ac_diagnostics <- compile_model_diagnostics("ifqrs_NO_ac")
+# # deriving the summary table for ifqrs_ac_riv_itom was not possible with 64 Gb RAM
+# # So just get the summary data for the least-well sampled parameter in ifqrs_ac_riv
+# itom_model_fit <- load_model_component_bundle("ifqrs_ac_riv_itom")$fit
+# mod_summary <- itom_model_fit$summary(variables = "sigma_epsilon");
+# ifqrs_ac_riv_itom_diagnostics <- rbind(ifqrs_ac_riv_itom_diagnostics,
+#             data.frame(spec = c("Min. Bulk ESS","Min. Tail ESS",
+#                                 "Least well-sampled parameter"),
+#                        value = c(round(mod_summary$ess_bulk),
+#                                  round(mod_summary$ess_tail),
+#                                  "sigma_epsilon (assumed)")))
+# common_specs <- ifqrs_ac_riv_itom_diagnostics[1:4,]
+# combined_specs <- cbind(ifqrs_ac_riv_diagnostics[5:16,],
+#                         ifqrs_ac_riv_itom_diagnostics[5:16,2],
+#                         ifqrs_ac_riv_no_phylo_diagnostics[5:16,2], 
+#                         ifqrs_no_ac_diagnostics[5:16,2])
+# names(combined_specs)[2:5] <- c("d/s AC + Phylo", "d/s AC + Phylo, alt EI", 
+#                                 "d/s AC only", "Phylo only")
+# save(combined_specs, common_specs, file = "~/temp/tab1.rda")
+load("~/temp/tab1.rda")
+names(common_specs) <- c("Specification","Value")
+ft_to_word(flextable::flextable(common_specs))
+```
+
+The four models using the 5 base fixed predictors had specifications as in @tbl-combined_specs.  All models passed the standard diagnostic tests. The "d/s AC + Phylo, alt EI" model compiled with adequate efficiency, but was the least efficient of the four models. As a result the minimum Bulk effective sample size (ESS) was less than the optimal 400. Nevertheless, its ESS was sufficient for the comparison with the other models.
+
+```{r}
+#| echo: false
+#| label: tbl-combined_specs
+#| tbl-cap: "Sampling diagnostics for the four trial base models."
+ 
+ft_to_word(flextable::flextable(combined_specs))
+```
+
+The four variants of the "d/s AC + Phylo" model with different combinations of fixed predictors also passed all diagnostic tests (@tbl-combined_specs_varied_fixed_preds). Minimum bulk ESS for the two most complex models was lower than optimal, but sufficiently high for comparisons of models and for preliminary analysis of predictions. More computer memory is required to increase ESS for these two models.
+
+```{r}
+#| echo: false
+#| label: tbl-combined_specs_varied_fixed_preds
+#| tbl-cap: "Sampling diagnostics for the four 'd/s AC + Phylo' models with differing combinations of fixed predictors."
+#  
+# ifqrs_ac_riv_diagnostics <- compile_model_diagnostics("ifqrs_ac_riv_6000")
+# ifqdtrs_ac_riv_diagnostics <- compile_model_diagnostics("ifqdtrs_ac_riv")
+# ifqdtbrs_ac_riv_diagnostics <- compile_model_diagnostics("ifqdtbrs_ac_riv")
+# ifqdtbrs_fi_qf_qd_ac_riv_diagnostics <- compile_model_diagnostics("ifqdtbrs_fi_qf_qd_ac_riv")
+# # deriving the summary table for ifqrs_ac_riv_itom was not possible with 64 Gb RAM
+# # So just get the summary data for the least-well sampled parameter in ifqrs_ac_riv
+# combined_specs_a <- cbind(ifqrs_ac_riv_diagnostics[5:16,],
+#                         ifqdtrs_ac_riv_diagnostics[5:16,2],
+#                         ifqdtbrs_ac_riv_diagnostics[5:16,2],
+#                         ifqdtbrs_fi_qf_qd_ac_riv_diagnostics[5:16,2])
+# names(combined_specs_a)[2:5] <- c("I, F, Q, nriff, season (base)", "base + D, T",
+#                                 "base + C, D, T, B", "base + C, D, T, B, I*F, I*Q, F*Q")
+# save(combined_specs_a, file = "~/temp/tab1a.rda")
+load("~/temp/tab1a.rda")
+ft_to_word(flextable::flextable(combined_specs_a))
+
+```
+
+The full model without the autocorrelation term sampled substantially more quickly (minimum bulk ESS of 400 could be achieved in 25 min, compared to 5 hours for the model with AC).  Removing the residual error term epsilon in addition to AC shortens sampling time further (minimum bulk ESS of 400 in < 10 min), although the single divergence for that model suggests an increase in adapt delta from 0.9 to 0.95, which will slow it a little.  Even if the final model were to include these two effects, assessment of optimal combinations of fixed variables could be achieved quickly by excluding them, perhaps with a larger trial set of species.
+
+```{r}
+#| echo: false
+#| label: tbl-combined_specs_full_vars
+#| tbl-cap: "Sampling diagnostics for the full model (with Phylogenetic covariance) with and without spatial autocorrelation and without epsilon."
+
+# ifqdtbrs_fi_qf_qd_ac_riv_diagnostics <- compile_model_diagnostics("ifqdtbrs_fi_qf_qd_ac_riv")
+# ifqdtbrs_fi_qf_qd_no_ac_diagnostics <- compile_model_diagnostics("ifqdtbrs_fi_qf_qd_NO_ac_6000")
+# ifqdtbrs_fi_qf_qd_no_ac_no_eps_diagnostics <-
+#   compile_model_diagnostics("ifqdtbrs_fi_qf_qd_NO_ac_NO_eps_6000")
+# 
+# # deriving the summary table for ifqrs_ac_riv_itom was not possible with 64 Gb RAM
+# # So just get the summary data for the least-well sampled parameter in ifqrs_ac_riv
+# combined_specs_a <- cbind(ifqdtbrs_fi_qf_qd_ac_riv_diagnostics[4:16,],
+#                           ifqdtbrs_fi_qf_qd_no_ac_diagnostics[4:16,2],
+#                           ifqdtbrs_fi_qf_qd_no_ac_no_eps_diagnostics[4:16,2])
+# names(combined_specs_a)[2:4] <- c("base + C, D, T, B, I*F, I*Q, F*Q",
+#                                 "base + C, D, T, B, I*F, I*Q, F*Q, no AC",
+#                                 "base + C, D, T, B, I*F, I*Q, F*Q, no AC or epsilon")
+# save(combined_specs_a, file = "~/temp/tab1b.rda")
+load("~/temp/tab1b.rda")
+ft_to_word(flextable::flextable(combined_specs_a))
+
+```
+## Model comparison
+
+### The four base models
+
+Models were compared using LOO-CV.  LOO-CV for all models had 2-5% Pareto k > 0.7, and computing power limitations precluded loo calculations with moment-matching to correct this. Therefore a difference of 4-5 times se_diff is required to infer a model is superior. On that basis, the "d/s AC + Phylo" and "d/s AC only" models were equally plausible, and both were much more plausible than "d/s AC + Phylo, alt EI" and "Phylo Only".  Thus there are strong arguments for:
+
+- including a spatial autocorrelation term in the model, and 
+
+- transforming EI by log(x + 0.001) rather than log(x + 0.01).
+
+```{r}
+#| label: tbl-loo_comparison
+#| echo: false
+#| tbl-cap: "Differences in Expected Log Pointwise Predictive Density (elpd_diff) between the four base tables to assess the importance of primary model decisions. "
+
+# ifqrs_ac_riv_loo <- load_model_component_bundle("ifqrs_ac_riv_6000")$loo
+# ifqrs_ac_riv_itom_loo <- load_model_component_bundle("ifqrs_ac_riv_itom")$loo
+# ifqrs_ac_riv_no_phylo_loo <- load_model_component_bundle("ifqrs_ac_riv_NO_phylo")$loo
+# ifqrs_no_ac_loo <- load_model_component_bundle("ifqrs_NO_ac")$loo
+# 
+# n_way_comparison <- loo::loo_compare(
+#   list("d/s AC + Phylo" = ifqrs_ac_riv_loo,
+#        "d/s AC + Phylo, alt EI" = ifqrs_ac_riv_itom_loo,
+#        "d/s AC only" = ifqrs_ac_riv_no_phylo_loo,
+#        "Phylo Only"  = ifqrs_no_ac_loo))
+# n_way_comparison <- data.frame(model = row.names(n_way_comparison),
+#                                n_way_comparison, row.names = NULL)
+# save(n_way_comparison, common_specs, file = "~/temp/tab2.rda")
+load("~/temp/tab2.rda")
+n_way_comparison[-1] <- round(n_way_comparison[-1])
+ft_to_word(flextable::flextable(n_way_comparison))
+```
+
+
+### The "d/s AC + Phylo" model with four combinations of fixed predictors (and the effect of removing A/C or epsilon)
+
+The model containing the three interaction terms is substantially superior to the three models without interactions (@tbl-loo_comparison_a). Addition of D, T and B to the base model did not produce models of any greater plausibility. Nevertheless, inclusion of D and T at least are important to the model to permit prediction of the effects of flow management and global warming, respectively.  C is important to include because it is an indicator of stream size: as such, it is correlated with distance downstream over large scales, and is likely to share variance with a spatial autocorrelation effect.
+
+Further assessment is required on whether removal of any of the fixed predictors, or the 3 interactions, or inclusion of other interactions might further improve the model.
+
+The removal of the AC effect reduced model quality (@tbl-loo_comparison_a), but not by as much as was the case for the base model (@tbl-loo_comparison). However, given that LOO-CV of all these models contain a small proportion of 'bad' Pareto ks, the difference of ~4 times se_diff is marginal for inferring model superiority (calculation of loo with moment matching is required for a more confident comparison, which requires more than available RAM).  T
+
+The model with both AC and epsilon removed was equally plausible to the model with AC removed.
+
+```{r}
+#| label: tbl-loo_comparison_a
+#| echo: false
+#| tbl-cap: "Differences in Expected Log Pointwise Predictive Density (elpd_diff) between the 'd/s AC + Phylo' model with four combinations of fixed predictors. "
+
+# ifqrs_ac_riv_loo <- load_model_component_bundle("ifqrs_ac_riv_6000")$loo
+# ifqdtrs_ac_riv_loo <- load_model_component_bundle("ifqdtrs_ac_riv")$loo
+# ifqdtbrs_ac_riv_loo <- load_model_component_bundle("ifqdtbrs_ac_riv")$loo
+# ifqdtbrs_fi_qf_qd_ac_riv_loo <- load_model_component_bundle("ifqdtbrs_fi_qf_qd_ac_riv")$loo
+# ifqdtbrs_fi_qf_qd_no_ac_loo <- load_model_component_bundle("ifqdtbrs_fi_qf_qd_NO_ac_6000")$loo
+# ifqdtbrs_fi_qf_qd_no_eps_loo <- load_model_component_bundle("ifqdtbrs_fi_qf_qd_NO_ac_NO_eps_6000")$loo
+# 
+# n_way_comparison <- loo::loo_compare(
+#   list("Base" = ifqrs_ac_riv_loo,
+#        "Base + C, D, T" = ifqdtrs_ac_riv_loo,
+#        "base + C, D, T, B" = ifqdtbrs_ac_riv_loo,
+#        "base + C, D, T, B, I*F, I*Q, F*Q"  = ifqdtbrs_fi_qf_qd_ac_riv_loo,
+#        "base + C, D, T, B, I*F, I*Q, F*Q, no AC"  = ifqdtbrs_fi_qf_qd_no_ac_loo,
+#        "base + C, D, T, B, I*F, I*Q, F*Q, no AC or epsilon" = ifqdtbrs_fi_qf_qd_no_eps_loo))
+# n_way_comparison <- data.frame(model = row.names(n_way_comparison),
+#                                n_way_comparison, row.names = NULL)
+# save(n_way_comparison, file = "~/temp/tab3.rda")
+load("~/temp/tab3.rda")
+n_way_comparison[-1] <- round(n_way_comparison[-1])
+ft_to_word(flextable::flextable(n_way_comparison))
+
+```
+
+### EI transformation
+
+The base model (with downstream spatial autocorrelation and phylogenetic variance) using I transformed as log(EI + 0.001)[^1] ("d/s AC + Phylo") is much more plausible than the model in which I = log(EI + 0.01) ("d/s AC + Phylo, alt EI") (@tbl-loo_comparison).  The latter model sampled less efficiently than the former (@tbl-combined_specs).  The coefficients for the I effect were larger for the base model, with more species having a probable response (11 negatively and 8 positively for "d/s AC + Phylo"; 8 and 5 for "d/s AC + Phylo, alt EI").  
+
+```{r}
+#| label: fig-I_effect_mod1v2
+#| echo: false
+#| fig-width: 7
+#| fig-height: 7
+#| fig-cap: "Coefficients of the effective imperviousness effect (I) for the 33 species in the base model with downstream AC and Phylogenetic covariance with EI transformed in two ways. log(EI + 0.001) produces larger responses."
+
+# ifqrs_ac_riv_fit <- load_model_component_bundle("ifqrs_ac_riv")$fit
+# ifqrs_ac_riv_itom_fit <- load_model_component_bundle("ifqrs_ac_riv_itom")$fit
+# # Names of all the I parameters
+# beta_1_names <- paste0("beta[1,", 1:nrow(species), "]")
+# # weirdly extracting from ifqrs_ac_riv_fit is very quick; ifqrs_ac_riv_itom_fit is very slow!
+# beta_1_draws_full <- ifqrs_ac_riv_fit$draws(variables = beta_1_names, 
+#                                                  format = "draws_matrix")
+# beta_quantiles_full <- matrixStats::colQuantiles(beta_1_draws_full, probs = c(0.025, 0.5, 0.975))
+# 
+# beta_1_draws_itom <- ifqrs_ac_riv_itom_fit$draws(variables = beta_1_names, 
+#                                                  format = "draws_matrix")
+# beta_quantiles_itom <- matrixStats::colQuantiles(beta_1_draws_itom, probs = c(0.025, 0.5, 0.975))
+# save(beta_quantiles_itom, beta_quantiles_full, file = "~/temp/fig1.rda")
+load("~/temp/fig1.rda")
+
+layout(matrix(1:2,1,2, byrow = TRUE), widths = c(28,12))
+par(mar = c(4, 14, 1, 1))
+plot(beta_quantiles_full[,2], species$species_no, xlim = range(beta_quantiles_full),
+      axes = FALSE, xlab = "I estimate", ylab = "")
+for(i in 1:nrow(species)){
+  coli <- ifelse(beta_quantiles_full[i,3] < 0, "#1b9e77", 
+                 ifelse(beta_quantiles_full[i,1] > 0, "#d95f02", "black"))
+  points(beta_quantiles_full[i,2], species$species_no[i], pch =21, bg = coli)
+  lines(c(beta_quantiles_full[i,1],beta_quantiles_full[i,3]), 
+        rep(species$species_no[i],2), col = coli)
+        }
+axis(1); axis(2, at = 1:nrow(species), labels = species$species, las = 1, cex.lab = 0.6); 
+abline(v = 0, lty = 3); box(bty = "l"); title(main = "log(EI + 0.001)")
+
+par(mar = c(4, 1, 1, 1))
+plot(beta_quantiles_itom[,2], species$species_no, xlim = range(beta_quantiles_full),
+      axes = FALSE, xlab = "I estimate", ylab = "")
+for(i in 1:nrow(species)){
+  coli <- ifelse(beta_quantiles_itom[i,3] < 0, "#1b9e77", 
+                 ifelse(beta_quantiles_itom[i,1] > 0, "#d95f02", "black"))
+  points(beta_quantiles_itom[i,2], species$species_no[i], pch =21, bg = coli)
+  lines(c(beta_quantiles_itom[i,1],beta_quantiles_itom[i,3]), 
+        rep(species$species_no[i],2), col = coli)
+        }
+axis(1); abline(v = 0, lty = 3); title(main = "log(EI + 0.01)")
+
+# sum(beta_quantiles_full[,3] < 0); sum(beta_quantiles_full[,1] > 0)
+# sum(beta_quantiles_itom[,3] < 0); sum(beta_quantiles_itom[,1] > 0)
+
+```
+
+log(EI + 0.001) is thus a stronger predictor of macroinvertebrate response than log(EI + 0.01). The large difference between the two transformations points to the importance of near-zero values of EI. 
+
+```{r}
+#| label: fig-ei_transformations_theory
+#| echo: false
+#| fig-width: 7
+#| fig-height: 3
+#| fig-cap: "The differences in spread of EI across theoretical degradation thresholds when transformed by log(x + 0.001) and log(x + 0.01)"
+
+ei_range <- c(0,0.4866348)
+test <- c(0,0.0001, 0.001, 0.01, 0.05, 0.1,max(ei_range)) # i.e. 0%, 0.01%, 0.1%, 1%, 48.7%
+ltest01 <- (log(test + 0.01) - min(log(test + 0.01)))/(max(log(test + 0.01)) - min(log(test + 0.01)))
+ltest001 <- (log(test + 0.001) - min(log(test + 0.001)))/(max(log(test + 0.001)) - min(log(test + 0.001)))
+par(mar = c(4, 10, 1,1))
+plot(c(ltest01, ltest001), rep(1:2, each = 7), pch = 21, bg = RColorBrewer::brewer.pal(7, "OrRd"), 
+     ylim = c(1,2.5), axes = 0, xlab = "Proportion of EI range", ylab = "")
+axis(1); axis(2, at = c(1,2), labels = c("log(EI + 0.01)","log(EI + 0.001)"), las = 1)
+for(i in 1:length(ltest01)){
+  lines(c(ltest01[i],ltest001[i]), c(1,2), col = RColorBrewer::brewer.pal(7, "OrRd")[i])
+}
+legend("top", legend = c(test[1:6]*100,49), pch = 21, cex = 1, pt.cex = 1,
+       pt.bg = RColorBrewer::brewer.pal(7, "OrRd"), title = "% EI", horiz = TRUE)
+
+```
+
+Theoretically, log(EI + 0.001) is a better predictor of stormwater impacts than log(EI + 0.01) because:
+
+- it compresses the effect of increasing EI from 10% to 50% (@fig-ei_transformations_theory). Broadly 10% EI is sufficient to severely degrade stream ecosystems and preclude the presence of most sensitive species. Beyond 10%, loss of habit, frequency of physical and chemical disturbance and loss of species is likely to lessened.  
+
+- it widens the effect of increasing EI from zero to 0.1% and to 1%  (@fig-ei_transformations_theory). It is in this range of EI that highly sensitive species are likely to be progressively lost, and species tolerance of disturbance are likely to appear. 
+
+[^1]: Note when referring to log(EI + 0.001) and log(EI + 0.01), EI is a proportion.  In exploring the difference, I use %EI for clarity (but fear I am only causing more confusion).  log(EI + 0.001) where EI is a fraction = log(%EI + 0.1), and log(EI + 0.01) = log(%EI + 1).
+
+The finding that log(EI + 0.001) is a better predictor likely indicates the importance of one or both of these effects. Inspection of the distributions of both tolerant and sensitive species with strong responses to EI suggest it is the latter effect (the importance of the difference between near-zero EI, say <0.01%, and a small EI impact, say 0.1% EI)
+
+It might be expected that a miniscule 0.1% EI must have negligible impact.  However, a thought experiment can provide a counter-argument. Take a small stream with a 2-km^2^ forested catchment as an example.  Constructing a 2000 m^2^ carpark drained by a pipe directly to the stream would produce flash flows of polluted runoff with every rain event (10 kL with 5 ML rain), when most events <10 mm produce no surface runoff from the catchment forest.  Such an increase in disturbance would be expected to have a negative impact on sensitive instream species in such a small stream. Such a 2000 m^2^ formally-drained carpark constitutes 0.1% EI. log(EI + 0.01) scales such an effect to be near-zero, while log(EI + 0.001) scales a larger difference (@fig-ei_transformations_theory).  
+
+```{r}
+#| label: fig-4spp_ei_hists
+#| echo: false
+#| fig-width: 7
+#| fig-height: 5
+#| fig-cap: "Distribution of occurrences across 6 ranges of EI of 4 species with strong responses to log(x + 0.001). Note, in each case, the important difference between the <0.0001 and 0.0001 to 0.001 range. These ranges are compressed by transforming EI by log(x + 0.01) rather than log(x + 0.001)."
+
+# Distributions of Oecetis minasata and Notalina B-ABV8023, and of Prostoma gracense and Simulium ornatipes against the 6 EI categories from the previous figure
+
+taxon_check <- taxon_all[taxon_all$taxon %in% c("Oecetis minasata","Notalina sp. B-ABV8023",
+                                 "Prostoma graecense","Simulium ornatipes"),]
+biota_check <- biota[biota$taxoncode %in% taxon_check$shortcode,]
+reaches_check <- unique(biota_check$reach)
+reach_ei <- DBI::dbGetQuery(mwstr, 
+paste0("SELECT reach, ei_l44_sw1942_2022 FROM cat_env WHERE reach IN ('",
+       paste(reaches_check, collapse = "', '"), "');"))
+biota_check$ei <- reach_ei$ei_l44_sw1942_2022[match(biota_check$reach, reach_ei$reach)]
+biota_check$ei_class <- 6
+biota_check$ei_class[biota_check$ei < 0.1] <- 5
+biota_check$ei_class[biota_check$ei < 0.05] <- 4
+biota_check$ei_class[biota_check$ei < 0.01] <- 3
+biota_check$ei_class[biota_check$ei < 0.001] <- 2
+biota_check$ei_class[biota_check$ei < 0.0001] <- 1
+
+hist_sp_ei <- function(species){
+spi <- biota_check[biota_check$taxon == species,]
+hist(spi$ei_class, xlim = c(0.5,6.5), xlab = "%EI range", axes = FALSE,
+     main = species, breaks = seq(0.5,6.5,1))
+axis(2, las = 1)
+axis(1, at = 1:6, labels = c("<0.01%","to 0.1%", "to 1%", 
+                             "to 5%", "to 10%", "to 50%"), cex.axis = 0.65)
+}
+par(mfrow = c(2,2), mar = c(4,4,1,1))
+hist_sp_ei("Oecetis minasata")
+hist_sp_ei("Notalina sp. B-ABV8023")
+hist_sp_ei("Prostoma graecense")
+hist_sp_ei("Simulium ornatipes")
+```
+
+### Phylogenetic covariance matrix 
+
+The full model and the model with downstream spatial autocorrelation and the full model without the phylogenetic covariance matrix are equally plausible (@tbl-loo_comparison). The addition of phylogenetic covariance did, however, slightly narrow the confidence intervals of parameter estimates of the three congeneric species in the 33-species trial set (@fig-koornonga_effects).
+
+I expect for the larger dataset with many congeneric species and many rare species, the phylogenetic covariance matrix will have a larger effect on model performance by reducing the confidence intervals of many more species. I therefore judge the additino of phylogenetic variance to the model is warranted.
+
+```{r}
+#| label: fig-koornonga_effects
+#| echo: false
+#| fig-width: 7
+#| fig-height: 3
+#| fig-cap: "Coefficients of the effective imperviousness (I) and forest effect (F) for the 3 species of Koorrnonga in the trial species set for the model with (black) and without (grey) phylogenetic covariance."
+
+# ifqrs_ac_riv_fit <- load_model_component_bundle("ifqrs_ac_riv")$fit
+# ifqrs_ac_riv_no_phylo_fit <- load_model_component_bundle("ifqrs_ac_riv_NO_phylo")$fit
+# # Names of I and F parameters for the three Koornonga species
+# koor_i_f_names <- c(paste0("beta[1,", grep("Koorrn",species$species), "]"), 
+#                     paste0("beta[2,", grep("Koorrn",species$species), "]"))
+# # weirdly extracting from ifqrs_ac_riv_fit is very quick; ifqrs_ac_riv_itom_fit is very slow!
+# beta_i_f_draws_full <- ifqrs_ac_riv_fit$draws(variables = koor_i_f_names,
+#                                                  format = "draws_matrix")
+# beta_i_f_quantiles_full <- matrixStats::colQuantiles(beta_i_f_draws_full, probs = c(0.025, 0.5, 0.975))
+# 
+# beta_i_f_no_phylo_draws <- ifqrs_ac_riv_no_phylo_fit$draws(variables = koor_i_f_names,
+#                                                  format = "draws_matrix")
+# beta_i_f_no_phylo_quantiles <- matrixStats::colQuantiles(beta_i_f_no_phylo_draws, probs = c(0.025, 0.5, 0.975))
+# save(beta_i_f_quantiles_full, beta_i_f_no_phylo_quantiles, file = "~/temp/fig2.rda")
+load("~/temp/fig2.rda")
+
+layout(matrix(1:2,1,2, byrow = TRUE), widths = c(28,13))
+par(mar = c(4, 14, 1, 1))
+plot(beta_i_f_quantiles_full[1:3,2], (1:3)-0.1, xlim = c(-2,1.6), ylim = c(0.5,3.5),
+      axes = FALSE, xlab = "I estimate", ylab = "", pch = 21, bg = "black")
+points(beta_i_f_no_phylo_quantiles[1:3,2], (1:3)+0.1,pch = 21, bg = "gray")
+for(i in 1:3){
+  lines(c(beta_i_f_quantiles_full[i,1],beta_i_f_quantiles_full[i,3]), rep(i-0.1,2), col = "black")
+  lines(c(beta_i_f_no_phylo_quantiles[i,1],beta_i_f_no_phylo_quantiles[i,3]), rep(i+0.1,2), col = "gray")
+        }
+axis(1); axis(2, at = 1:3, labels = species$species[grep("Koorrn",species$species)], las = 1, cex.lab = 0.6); 
+abline(v = 0, lty = 3); box(bty = "l"); title(main = "I effect")
+
+par(mar = c(4, 0, 1, 1))
+plot(beta_i_f_quantiles_full[4:6,2], (1:3)-0.1, xlim = c(-2,1.6), ylim = c(0.5,3.5),
+      axes = FALSE, xlab = "I estimate", ylab = "", pch = 21, bg = "black")
+points(beta_i_f_no_phylo_quantiles[4:6,2], (1:3)+0.1,pch = 21, bg = "gray")
+for(i in 4:6){
+  lines(c(beta_i_f_quantiles_full[i,1],beta_i_f_quantiles_full[i,3]), rep(i-3.1,2), col = "black")
+  lines(c(beta_i_f_no_phylo_quantiles[i,1],beta_i_f_no_phylo_quantiles[i,3]), rep(i-2.9,2), col = "gray")
+        }
+axis(1); abline(v = 0, lty = 3); title(main = "F effect")
+
+```
+
+### Spatial autocorrelation
+
+The downstream-distance-decay parameter, `rho_space`, was non-zero in both the base model and the best model, pointing to some global spatial autocorrelation of macroinvertebrate occurrences in the river network. Decay distance was substantially shorter in the best model (@fig-ac_effects), probably because it includes catchment-area as a predictor, which is likely to share variance with a spatial autocorrelation effect.  
+
+```{r}
+#| label: fig-ac_effects
+#| echo: false
+#| fig-width: 7
+#| fig-height: 3
+#| fig-cap: "Mean and 95% CL estimates of the global downstream autocorrelation effect in a) the base model and b) the best model (base + C, D, T, B, I*F, I*Q, F*Q)."
+
+# base_fit <- load_model_component_bundle("ifqrs_ac_riv")$fit
+# base_dtb_ints_fit <- load_model_component_bundle("ifqdtbrs_fi_qf_qd_ac_riv")$fit
+# 
+# base_rho_draws <- as.data.frame(base_fit$draws(
+#   variables = c("rho_space", "sigma_space"),format = "draws_matrix"))
+# base_dtb_ints_rho_draws <- as.data.frame(base_dtb_ints_fit$draws(
+#   variables = c("rho_space", "sigma_space"), format = "draws_matrix"))
+# 
+# dist_plot <- seq(0.1,190,0.1)
+# weight <- data.frame(dist = dist_plot, w_025 = NA, w_500 = NA, w_975 = NA)
+# for(i in 1:length(dist_plot)){
+#   weighti <- base_rho_draws$sigma_space^2 *
+#     exp(-dist_plot[i]^2/(2*(base_rho_draws$rho_space*190)^2))
+#   weight[i,2:4] <- quantile(weighti,c(0.025,0.5,0.975))
+# }
+# weight_1 <- data.frame(dist = dist_plot, w_025 = NA, w_500 = NA, w_975 = NA)
+# for(i in 1:length(dist_plot)){
+#   weighti <- base_dtb_ints_rho_draws$sigma_space^2 *
+#     exp(-dist_plot[i]^2/(2*(base_dtb_ints_rho_draws$rho_space*190)^2))
+#   weight_1[i,2:4] <- quantile(weighti,c(0.025,0.5,0.975))
+# }
+# save(weight, weight_1, file = c("~/temp/ac_fig.rda"))
+load("~/temp/ac_fig.rda")
+layout(matrix(c(1,2,3,3), 2, 2, byrow = TRUE), widths = c(12, 10), heights = c(10,1))
+par(mar = c(2,4,1,1))
+plot(weight$dist, weight$w_975, type = "l", lty = 3, xlim = c(0,190), 
+     ylim = c(0,1), axes = FALSE, xlab = "", ylab = "Weighting")
+lines(weight$dist, weight$w_025, lty = 3)
+lines(weight$dist, weight$w_500, lty = 1, lwd = 2)
+axis(1); axis(2, las = 1); box(bty= "l")
+par(mar = c(2,1,1,1))
+plot(weight_1$dist, weight_1$w_975, type = "l", lty = 3, 
+     xlim = c(0,190), ylim = c(0,1), axes = FALSE, xlab = "", ylab = "")
+lines(weight_1$dist, weight_1$w_025, lty = 3)
+lines(weight_1$dist, weight_1$w_500, lty = 1, lwd = 2)
+axis(1); axis(2, at = seq(0,1,0.2), labels = rep("",6)); box(bty= "l")
+
+```
+
+The latter estimate suggests that spatial autocorrelation extends for ~50 km downstream. This is longer than the 1.7-13.5 km distance to independence inferred by @shupryt_studinski_2021 or the similar distance range inferred by @lloyd_etal_2005 for one of the two Victorian rivers they studies.
+
+Despite the global autocorrelation effect, very few species-site cases showed a strong autocorrelation effect (delta) - only 5 cases (out of 7359) with >95% confidence of a positive autocorrelation. A further 31 cases with a high but uncertain mean delta, pointing to a high uncertainty in the model.
+
+This raises two questions for the development of this model:
+
+1. Should the autocorrelation effect be included in predictions of species occurrences to new sites?
+
+2. Is the autocorrelation effect necessary in the model at all?
+
+The answer to the first question is certainly no.  The sparseness of the dataset in the autocorrelation effect will result in most sites being essentially isolated. If the highly uncertain delta were to be propogated into a new site (to permit prediction) through a sparse matrix, the variance of new prediction will be widened without substantial change to the mean estimate.
+
+To answer the second question, I tested the base + C, D, T, B, I\*F, I\*Q, F\*Q model without an AC term, and assessed whether that substantially changed beta estimates. betas from the two models did not differ strongly.  12 of the 429 betas had 95% CLs not spanning zero in one model but not the other. 5 of these were non-zero in the no-ac model and 7 were in the ac-model, and all were near zero, suggesting that these differences were largely stochastic.  However, 93 out of 429 betas had CL ranges more than 0.2 wider in non_ac than ac while only 7 were <0.2 narrower.  All but one of the wider non_ac betas were Q, Q2 or Q\*F and they involved all species.
+
+Thus removing AC made little difference to strong beta estimates, but produced estimates with broader CLs in ~20% of betas - all Q-related effects.   
+
+```{r}
+#| eval: false
+#| 
+ac_fit <- load_model_component_bundle("ifqdtbrs_fi_qf_qd_ac_riv")$fit
+no_ac_fit <- load_model_component_bundle("ifqdtbrs_fi_qf_qd_NO_ac_6000")$fit
+ac_betas <- ac_fit$draws(variables = "beta", format = "draws_matrix")
+ac_betas <- matrixStats::colQuantiles(ac_betas, probs = c(0.025, 0.5, 0.975))
+no_ac_betas <- no_ac_fit$draws(variables = "beta", format = "draws_matrix")
+no_ac_betas <- matrixStats::colQuantiles(no_ac_betas, probs = c(0.025, 0.5, 0.975))
+
+x <- which(ac_betas[,1] > 0 & no_ac_betas[,1] <= 0 |
+      ac_betas[,1] <= 0 & no_ac_betas[,1] > 0 |
+      ac_betas[,3] < 0 & no_ac_betas[,1] >= 0 |
+      ac_betas[,3] >= 0 & no_ac_betas[,3] < 0)
+y <- which(ac_betas[,3] - ac_betas[,1] - no_ac_betas[,3] + no_ac_betas[,1] < -0.2)
+z <- which(ac_betas[,3] - ac_betas[,1] - no_ac_betas[,3] + no_ac_betas[,1]  > 0.2)
+cbind(ac_betas[x,],no_ac_betas[x,])
+# 5 betas with strong response in no_ac, but not in ac (all near calls)
+# 7 betas with strong response in ac, but not no_ac 
+# (6 of these had CL range >0.2 wider in no_ac, all involving response to Q)
+cbind(ac_betas[y,],no_ac_betas[y,])
+# 93 out of 429 betas had CL ranges more than 0.2 wider in non_ac than ac (y)
+# while only 7 went the other way.
+# So removing ac made little difference to strong beta estimates, but produced 
+# estimates with narrower CLs in ~20% of cases, all but one involving Q, Q2 or Q*F 
+# across most species.
+# not critical?
+
+```
+
+Other arguments for excluding the AC term (both from Google AI) are:
+
+When spatial data is sparse, the model will struggle to separate whether a high probability of occurrence at a downstream site is caused by downstream drift (delta), general habitat characteristics (u), site-specific traits (a_site), or random noise (epsilon).  
+
+THe model is estimating a complex, asymmetric 223 * 223 covariance matrix across 33 species, yet it only finds 5 instances where the data strongly supports a spatial effect.When a model has enough mathematical flexibility to fit background noise (improving metrics like LOO) but fails to resolve individual parameters cleanly, it is often capturing tiny, idiosyncratic quirks of the specific training dataset. This can actually degrade the model's ability to generalise to new river networks.
+
+```{r}
+#| echo: false
+#| label: now_redundant_delta_exploration
+#| eval: false
+#| 
+best_summary <-load_model_component_bundle("ifqdtbrs_fi_qf_qd_ac_riv")$summary
+delta_summ <- best_summary[grep("delta", best_summary$variable),]
+delta_neg <- delta_summ[delta_summ$q95 < 0,] # 1 (33,10)
+delta_pos <- delta_summ[delta_summ$q5 > 0,] # 5
+sites[c(27:29,167),c(1,5,7)]
+species[c(5,24,32),]
+# Stylodrilus heringianus along Dandenong Creek - Invasive species @pinder_2013, collected in drift samples @lencioni_2004  (Sig positive delta down Dandenong Creek)
+# Drepanovelia dubia and Triplectides ciuskus in Yarra at Corranderk confluence 
+delta_summ[delta_summ$mean > 1.9,]  # Not strong inference, but a strong mean effect
+# sites "YAR_156085" "XZZ_5042"   "YAR_34210"  "YAR_215585" "WOY_36444"  "YAR_34210"  "YAR_156085" "BNY_70930"  "EMU_14214"  # all downstream of other sites.
+# ~ 20 species  all potential drifters. downes_etal_2017 as one potential source for this contention.
+
+```
+
+### Assessment of the best model's quality
+
+Tjur’s R^2^ is a value between 0 and 1 that measures the accuracy of the model to distinguish presences from absences.  Broadly >0.5 indicates excellent differentiation, while <0.1 indicates poor differentiation.
+
+Tjur’s R^2^ was >0.5 for 12 of the 33 species, and the 95% CLs of Tjur’s R^2^ spanned 0.5 for 29 species. No species were poorly differentiated (@fig-tjurs).
+
+```{r}
+#| label: fig-tjurs
+#| echo: false
+#| fig-width: 5
+#| fig-height: 7
+#| fig-cap: ""
+
+# fit <- load_model_component_bundle("ifqdtbrs_fi_qf_qd_NO_ac")$fit
+# tjur_draws <- fit$draws(variables = "tjurs_r2",format = "draws_matrix")
+# tjur_quantiles <- data.frame(matrixStats::colQuantiles(tjur_draws,
+#                                         probs = c(0.025, 0.5, 0.975)))
+# save(tjur_quantiles, file = "~/temp/fig_tjur_data.rda")
+load("~/temp/fig_tjur_data.rda")
+par(mar = c(4, 14, 1, 1))
+plot(tjur_quantiles[,2], species$species_no, xlim = c(0,1),
+      axes = FALSE, xlab = "Tjur's R2", ylab = "")
+for(i in 1:nrow(species)){
+  coli <- "grey"
+  points(tjur_quantiles[i,2], species$species_no[i], pch =21, bg = coli)
+  lines(c(tjur_quantiles[i,1],tjur_quantiles[i,3]), 
+        rep(species$species_no[i],2), col = coli)
+        }
+axis(1); axis(2, at = 1:nrow(species), labels = species$species, las = 1, cex.lab = 0.6); 
+abline(v = 0.1, lty = 3); abline(v = 0.5, lty = 3); box(bty = "l"); 
+
+```
+
+Expected species richness pre sample of the 33 species in the model was moderately well predicted by the model (@fig-exp_richness), although richness of samples that contained very few species tended to be overestimated, and richness of samples that contained the most species tended to be underestimated.
+
+It would be good to discuss this result...I think I recall you overcoming this problem with your models, Tom?
+
+```{r}
+#| label: fig-exp_richness
+#| echo: false
+#| fig-width: 5
+#| fig-height: 5
+#| fig-cap: ""
+
+# # Extract simulated data
+# y_rep_array <- y_rep_matrix <- fit$draws("y_rep", format = "matrix")
+# y_rep_matrix <- as.matrix(y_rep_matrix)
+# # 2. Rebuild the 3D array: 24000 draws, 33 species, 275 samples
+# # R fills arrays column-first, which perfectly matches how Stan flattens arrays:
+# # y_rep[1,1], y_rep[2,1], ..., y_rep[33,1], y_rep[1,2]...
+# y_rep_array <- array(y_rep_matrix, dim = c(8000, 275, 33))
+# expected_richness_draws <- apply(y_rep_array, c(1, 2), sum) # Dimensions: 24000 x 275
+# 
+# # Compute statistics column-wise for the 275 samples
+# richness_summary <- data.frame(
+#   sample_id     = 1:275,
+#   obs_richness = apply(biota_ct, 1, FUN = sum),
+#   mean_richness = colMeans(expected_richness_draws),
+#   ci_lower      = apply(expected_richness_draws, 2, quantile, probs = 0.025),
+#   ci_upper      = apply(expected_richness_draws, 2, quantile, probs = 0.975),
+#   row.names     = NULL
+# )
+# save(richness_summary, file = "~/temp/exp_richness.rda")
+load("~/temp/exp_richness.rda")
+
+plot(richness_summary$obs_richness, richness_summary$mean_richness, 
+     ylim = c(0,27), xlim = c(0,27), xlab = "Observed richness",
+     ylab = "Predicted richness", axes = FALSE)
+abline = c(0,1)
+for(i in 1:nrow(richness_summary)){
+  lines(rep(richness_summary$obs_richness[i],2),
+    c(richness_summary$ci_lower[i], richness_summary$ci_upper[i]))
+}
+abline(0,1,lty = 3); axis(1); axis(2, las = 1); box(bty = "l")
+
+# # Alternative approach using predicted 0s and 1s
+# simulated_presence <- array(
+#   rbinom(length(y_rep_array), size = 1, prob = y_rep_array),
+#   dim = dim(y_rep_array)
+# )
+# 
+# # Sum presence/absence over species (dimension 2)
+# sim_richness_draws <- apply(simulated_presence, c(1, 2), sum)
+# 
+# # Compute statistics
+# sim_richness_summary <- data.frame(
+#   sample_id     = 1:275,
+#   obs_richness = apply(biota_ct, 1, FUN = sum),
+#   mean_richness = colMeans(sim_richness_draws),
+#   ci_lower      = apply(sim_richness_draws, 2, quantile, probs = 0.025),
+#   ci_upper      = apply(sim_richness_draws, 2, quantile, probs = 0.975),
+#   row.names     = NULL
+# )
+# 
+# plot(sim_richness_summary$obs_richness, sim_richness_summary$mean_richness, 
+#      ylim = range(c(sim_richness_summary$ci_upper, sim_richness_summary$ci_lower)))
+# abline = c(0,1)
+# for(i in 1:nrow(sim_richness_summary)){
+#   lines(rep(sim_richness_summary$obs_richness[i],2),
+#     c(sim_richness_summary$ci_lower[i], sim_richness_summary$ci_upper[i]))
+# }
+# abline(0,1,lty = 3)
+# # # Extract the numeric index from the string (e.g., "3" from "y_rep[1,3]") and sort
+# # sample_numbers <- as.numeric(gsub(".*,([0-9]+)\\]", "\\1", richness_summary$sample_name))
+# # richness_summary <- richness_summary[order(sample_numbers), ]
+# 
+
+
+```
+
+
+

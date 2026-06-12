@@ -1,0 +1,149 @@
+
+```{r}
+#| echo: false
+
+spno <- current_species_list[current_idx]
+
+source("working_functions.R")
+fit <- load_model_component_bundle("ifqdtbrs_fi_qf_qd_NO_ac")$fit
+
+sp <- species$species[species$species_no == spno]
+taxonomy <- readRDS(
+  url("https://tools.thewerg.unimelb.edu.au/mwbugs/data/spp_classes_itis.rds"))[sp][[1]]
+sp_tax <- paste0("Taxoncode ", species$taxon_code[species$species_no == spno],
+                 " (",
+                 ifelse('subfamily' %in% taxonomy$rank,
+                paste0(taxonomy$name[taxonomy$rank == 'subfamily'], "; "),
+                         ""),
+                 taxonomy$name[taxonomy$rank == 'family'], 
+                 "; ", taxonomy$name[taxonomy$rank == 'order'], "; ", 
+                 taxonomy$name[taxonomy$rank == 'class'], ")")
+
+```
+
+### `r sp`
+
+#### `r sp_tax`
+
+```{r}
+#| echo: false
+#| message: false
+#| warning: false
+#| fig-height: 7
+#| fig-width: 4
+#| fig-cap: !expr paste("Median and 95% confidence limit responses of", sp, "to the model predictors. Green indicates a non-zero positive response; orange, a non-zero negative response. I = Effective imperviousness, F = Attenuated forest cover, Q = mean annual runoff depth, C = catchment area, T = mean annual air temperature, D = degree of regulation, B = proportion of catchment with basaltic geology, nriff = riffle habitat sampled, season = autumn (0) or spring (1). Other predictors are interaction terms.")
+
+# ### label: !expr paste0("fig-predictor_responses-", current_spno)
+
+preds <- c("I","F","Q","Q2","C","T","D","B","nriff","season","I*F","I*Q","F*Q")
+spno_beta_names <- paste0("beta[",1:length(preds),",",spno,"]")
+spno_beta_draws <- fit$draws(variables = spno_beta_names,format = "draws_matrix")
+spno_beta_quantiles <- data.frame(matrixStats::colQuantiles(spno_beta_draws, 
+                                                  probs = c(0.025, 0.5, 0.975)))
+par(mfrow = c(1,1),bg = "white", mar = c(4,4,1,1))
+plot(spno_beta_quantiles$X50., 1:length(preds), 
+     xlim = range(spno_beta_quantiles), axes = FALSE, 
+     xlab = "Estimate", ylab = "")
+for(i in 1:length(preds)){
+  coli <- ifelse(spno_beta_quantiles$X97.5.[i] < 0, "#1b9e77", 
+                 ifelse(spno_beta_quantiles$X2.5.[i] > 0, "#d95f02", "black"))
+  points(spno_beta_quantiles$X50.[i], i, pch =21, bg = coli)
+  lines(c(spno_beta_quantiles$X2.5.[i],spno_beta_quantiles$X97.5.[i]), 
+        rep(i,2), col = coli)
+        }
+axis(1); abline(v = 0, lty = 3); box(bty = "l")
+axis(2, at = 1:length(preds), labels = preds, las = 1, cex.lab = 0.8)
+```
+
+{{< pagebreak >}}
+
+```{r}
+#| echo: false
+#| message: false
+#| warning: false
+#| fig-height: 7
+#| fig-width: 7
+#| fig-cap: !expr paste("Mean predicted probability of occurrence of", sp, "in the Melbourne region, A. with current human impacts, and B. in the absence of human impacts (Reference condition).  C and D show the uncertainty of the predictions as the difference between the 95% confidence intervals of the probabilities in A and B, respectively.") 
+
+# ### label: !expr paste0("fig-p_maps-", current_spno)
+
+u_curr <- curr_data$scaled_pred_data # loaded by working_functions.R
+u_ref <- ref_data$scaled_pred_data   # loaded by working_functions.R
+# Remove lowness predictor, not used in earlier models
+u_curr <- u_curr[,colnames(u_curr) != "L"]
+u_ref <- u_ref[,colnames(u_ref) != "L"]
+colnames(u_curr)[match(c("F_I","Q_F"),colnames(u_curr))] <- c("FI","QF")
+colnames(u_ref)[match(c("F_I","Q_F"),colnames(u_ref))] <- c("FI","QF")
+samples_u_full <- samples_u_full[,colnames(samples_u_full) != "L"] 
+# from model_allvars_data.rda loaded by working_functions.R
+
+prob_curr_marginal <- predict_to_new(
+      samples_u_full, 
+       u_curr # note using default n_riff = 1, season = 1
+               )
+prob_ref_marginal <- predict_to_new(
+      samples_u_full, # from model_allvars_data.rda loaded by working_functions.R
+       u_ref # note using default n_riff = 1, season = 1
+               )
+
+p_means <- colMeans(prob_curr_marginal)
+streams_to_plot$p <- p_means[match(streams_to_plot$reach, 
+                                   db_curr_data$reach)] 
+# loaded in working_functions.R
+streams_to_plot$col <- RColorBrewer::brewer.pal(9,"YlGnBu")[cut(streams_to_plot$p, breaks = 9)]
+streams_to_plot$col[is.na(streams_to_plot$col)] <- "grey"
+
+layout(matrix(c(1:5,5), 3,2, byrow = TRUE), 
+                   widths = c(9,9),heights = c(9,9,2))
+par(bg = gray(0.8))
+par(mar = c(0,2,2,1))
+plot(streams_to_plot$geom, col = streams_to_plot$col)
+plot(coast$geom, add = TRUE)
+title(main = "  A.", adj = 0, line = -1.5); box()
+title(main = "Mean Prob. of Occurrence")
+mtext("Current", side = 2, line = 0.5, las = 0, font = 2, cex = 0.9)
+
+# plot uncertainty
+par(mar = c(0,0,2,2))
+p_unc <- apply(prob_curr_marginal, 2, quantile, probs = 0.975, na.rm = TRUE) - 
+          apply(prob_curr_marginal, 2, quantile, probs = 0.025, na.rm = TRUE) 
+streams_to_plot$p <- p_unc[match(streams_to_plot$reach, db_curr_data$reach)]
+streams_to_plot$col <- RColorBrewer::brewer.pal(9,"YlGnBu")[cut(streams_to_plot$p, breaks = 9)]
+streams_to_plot$col[is.na(streams_to_plot$col)] <- "grey"
+plot(streams_to_plot$geom, col = streams_to_plot$col)
+plot(coast$geom, add = TRUE)
+title(main = "  B.", adj = 0, line = -1.5); box()
+title(main = "Prediction uncertainty")
+
+p_means <- colMeans(prob_ref_marginal)
+streams_to_plot$p <- p_means[match(streams_to_plot$reach, 
+                                   db_ref_data$reach)] 
+streams_to_plot$col <- RColorBrewer::brewer.pal(9,"YlGnBu")[cut(streams_to_plot$p, breaks = 9)]
+streams_to_plot$col[is.na(streams_to_plot$col)] <- "grey"
+
+par(mar = c(0,2,1,1))
+plot(streams_to_plot$geom, col = streams_to_plot$col)
+plot(coast$geom, add = TRUE)
+title(main = "  C.", adj = 0, line = -1.5); box()
+mtext("Reference", side = 2, line = 0.5, las = 0, font = 2, cex = 0.9)
+
+# plot uncertainty
+p_unc <- apply(prob_ref_marginal, 2, quantile, probs = 0.975, na.rm = TRUE) - 
+          apply(prob_ref_marginal, 2, quantile, probs = 0.025, na.rm = TRUE) 
+streams_to_plot$p <- p_unc[match(streams_to_plot$reach, db_ref_data$reach)]
+par(mar = c(0,0,1,2))
+streams_to_plot$col <- RColorBrewer::brewer.pal(9,"YlGnBu")[cut(streams_to_plot$p, breaks = 9)]
+streams_to_plot$col[is.na(streams_to_plot$col)] <- "grey"
+plot(streams_to_plot$geom, col = streams_to_plot$col)
+plot(coast$geom, add = TRUE)
+title(main = "  D.", adj = 0, line = -1.5); box()
+plot.new()
+par(mar = c(2,2.5,0,2.5))
+legend("center", lty = 1, col = RColorBrewer::brewer.pal(9,"YlGnBu"), 
+       legend = c("0-0.11","0.11-0.22","0.21-0.33","0.33-0.44","0.44-0.56",
+           "0.56-0.67","0.67-0.78","0,78-0.89","0.89-1"), 
+       cex = 0.85, horiz = TRUE)
+par(bg = "white", mar = c(4,4,1,1))
+invisible(gc(verbose = FALSE))
+
+```
