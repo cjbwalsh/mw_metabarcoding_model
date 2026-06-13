@@ -1,27 +1,33 @@
-library(cmdstanr)
-library(posterior)
-library(knitr)     # Required for kable() markdown formatting
-library(data.table)
+suppressPackageStartupMessages(library(cmdstanr))
+suppressPackageStartupMessages(library(posterior))
+suppressPackageStartupMessages(library(data.table))
 
-save_model_summary <- function(mod_code, 
-                               mod_dir = "~/uomShare/wergStaff/ChrisW/git-data/=mw_metabarcoding_model/trial_33spp_models/"){
-  mod_dir <-paste0(mod_dir, mod_code)
-  mod_files <- paste0(mod_dir, "/", dir(mod_dir))
-  mod_files <- mod_files[!grepl("diagnostic_summary", mod_files)]
-  cmdstan_path <- cmdstanr::cmdstan_path()
-  stansummary_binary <- file.path(cmdstan_path, "bin", "stansummary")
-  output_csv_summary <- paste0("temp_data/", mod_code, "_diagnostic_summary.csv")
-  cmd <- paste0('"', stansummary_binary, '" --csv_filename="', output_csv_summary, '" ', paste(mod_files, collapse = " "))
-  system(cmd)
-  system(paste0("mv temp_data/", mod_code,  output_csv_summary, " ", mod_dir))
+ft_to_word <- function(ft, pgwidth = 7){
+  # Set as autofit to make width parameters adjustable
+  ft_out <- flextable::autofit(ft)
+  # Set width as function of page width
+  ft_out <- flextable::width(ft_out, width = dim(ft_out)$widths*pgwidth /(flextable::flextable_dim(ft_out)$widths))
+  return(ft_out)
 }
 
-compile_model_diagnostics <- function(mod_code,
-                                      mod_dir = "~/uomShare/wergStaff/ChrisW/git-data/=mw_metabarcoding_model/trial_33spp_models/"){
+load_model_component_bundle <- function(mod_code, 
+                                        mod_dir = paste0("~/uomShare/wergStaff/ChrisW/git-data/",
+                                                         "mw_metabarcoding_model/trial_33spp_models/")){
   mod_dir <-paste0(mod_dir, mod_code)
   mod_files <- paste0(mod_dir, "/", dir(mod_dir))
-  mod_files <- mod_files[!grepl("diagnostic_summary", mod_files)]
-  mod_summary <- paste0(mod_dir, "/", mod_code, "_diagnostic_summary.csv")
+  mod_files <- mod_files[grepl(".csv", mod_files)]
+  mod_bundle <- readRDS(paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
+  mod_bundle
+}
+
+compile_model_diagnostics <- function(mod_code, 
+                                      mod_dir = paste0("~/uomShare/wergStaff/ChrisW/git-data/",
+                                                       "mw_metabarcoding_model/trial_33spp_models/")){
+  mod_path <-paste0(mod_dir, mod_code)
+  mod_files <- paste0(mod_path, "/", dir(mod_path))
+  mod_files <- mod_files[grepl(".csv", mod_files)]
+  mod_bundle <- load_model_component_bundle(mod_code, mod_dir)
+  diagnostic_summary <- mod_bundle$diagnostics
   out_tab <- data.frame(spec = NA, value = NA)[0,]
   ## Metadata
   metadata <- suppressWarnings(data.table::fread(
@@ -37,20 +43,33 @@ compile_model_diagnostics <- function(mod_code,
   ## Time taken
   t_taken <- vector("numeric")
   for(i in 1:length(mod_files)){
-  time_taken_i <- suppressWarnings(data.table::fread(
-                 cmd = paste("tail -n 15", shQuote(path.expand(mod_files[i]))),
-                  skip = "#" ))
-  time_taken_i <- time_taken_i[!is.na(time_taken_i$Elapsed),]
-  t_taken <- c(t_taken, as.numeric(tail(time_taken_i$Elapsed,1))/60) # time taken in minutes
+    time_taken_i <- suppressWarnings(data.table::fread(
+      cmd = paste("tail -n 15", shQuote(path.expand(mod_files[i]))),
+      skip = "#" ))
+    time_taken_i <- time_taken_i[!is.na(time_taken_i$Elapsed),]
+    t_taken <- c(t_taken, as.numeric(tail(time_taken_i$Elapsed,1))/60) # time taken in minutes
   }
   t_tab <- data.frame(spec = "Modelling time (min)", value = round(max(t_taken)))
   out_tab <- rbind(out_tab, t_tab)
-  # ESS
-  mod_summary <- read.csv(mod_summary)
-  s_tab <- data.frame(spec = c("Min. Bulk ESS","Min. Tail ESS","Least well-sampled parameter"),
-                      value = c(min(mod_summary$ESS_bulk, na.rm = TRUE),
-                                min(mod_summary$ESS_tail, na.rm = TRUE),
-                                mod_summary$name[which(mod_summary$ESS_bulk.s == min(mod_summary$ESS_bulk.s, na.rm = TRUE))]))
+  # stan diagnostics
+  s_tab <- data.frame(spec = c("No. divergences", "No. exceeding max_treedepth",
+                               "BFMI (chain 1)","BFMI (chain 1)",
+                               "BFMI (chain 3)","BFMI (chain 4)"),
+                      value = c(sum(diagnostic_summary$num_divergent),
+                                sum(diagnostic_summary$num_max_treedepth),
+                                round(diagnostic_summary$ebfmi,2)))
   out_tab <- rbind(out_tab, s_tab)
+  # ESS
+  if("summary" %in% names(mod_bundle)){
+    mod_summary <- mod_bundle$summary
+    s_tab1 <- data.frame(spec = c("Min. Bulk ESS","Min. Tail ESS",
+                                  "Least well-sampled parameter"),
+                         value = c(round(min(mod_summary$ess_bulk, na.rm = TRUE)),
+                                   round(min(mod_summary$ess_tail, na.rm = TRUE)),
+                                   mod_summary$variable[
+                                     which(mod_summary$ess_bulk == min(mod_summary$ess_bulk, na.rm = TRUE))]))
+    out_tab <- rbind(out_tab, s_tab1)
+  }
+  out_tab
 }
 

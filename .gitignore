@@ -3,3 +3,12 @@
 .RData
 .Ruserdata
 *.Rproj
+#.pdf
+*.docx
+!report_style.docx
+auto_generated_master_files/
+species_report_master_files/
+stancode/*
+!stancode/*.*
+temp_data/
+temp.stan
