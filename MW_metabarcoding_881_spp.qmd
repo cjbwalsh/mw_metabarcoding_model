@@ -1,0 +1,26 @@
+---
+title: "Full model run"
+format: docx
+editor: source
+---
+
+
+```{r}
+#| label: setup
+#| echo: false
+
+source("quick_881_spp_data_assembly.R")
+# This creates data ready for the model for constrained_z
+source("cmdstanr_functions.R")
+# post processing functions
+
+```
+
+
+```{r}
+
+run_881spp_model(pred_site = pred_site,
+                 mod_code = "ifqcdtblrs_fi_qf_qi",
+                 mod_path = "stancode/jointspp_pa_no_eps_ou.stan")
+
+```

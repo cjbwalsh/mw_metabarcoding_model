@@ -1,0 +1,516 @@
+---
+title: "Optimization of phylogenetic covariance calculation in the 200-species model"
+author: "Christopher J Walsh"
+format: docx
+editor: source
+bibliography: references.bib
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+#| label: setup
+#| echo: false
+
+source("quick_200_spp_data_assembly_for_vcv_opt.R")
+# This creates data ready for the model, excluding phylo_cor, 
+# which needs to be added for each trial
+# Also includes the run_200spp_model() function, which runs each model
+# given a site-level predictor set and a mod_code
+
+source("cmdstanr_functions.R")
+# post processing functions
+
+```
+
+### Introduction
+
+This document aims to optimize the calculation of the phylogenetic matrix, $\mathbf{\Sigma}_{\text{phylo}}$, used as a data input for the "joint_spp_no_eps.stan", modelling the 200-species subset of the full 883-species dataset (containing all 103 species with site-prevalence >20% and 97 species with lesser prevalence). 
+
+We constructed a classification object for all 983 species in the Melbourne Water Macroinvertebrate Database [@walsh_2025], using the R package `taxize`, primarily drawn from the Integrated Taxonomic Information System database [@itis_2026]. We constructed taxonomic tables consistent with ITIS conventions for taxa missing from ITIS (using the code: ~/uomShare/wergStaff/ChrisW/git-data/mwbugs/build_phylo_vcv.R). 
+
+The taxonomic ranks assigned in ITIS tables varied, and several ranks were uncommonly used.  We inspected the four most uncommon ranks, and assess the extent to which they distinguish the next highest rank among species in the dataset.  Infraorder is informative and kept, but subgenus, subtribe and section were uninformative in that they were only applied to a single taxon at the next highest level.  The exception was subgenus which separated two species of Culicideae. These cases were insufficiently common to justify retaining subgenus as a rank.  We edited the classification object accordingly.
+
+```{r}
+#| echo: false
+
+spp_class_all <- readRDS(
+  url("https://tools.thewerg.unimelb.edu.au/mwbugs/data/spp_classes_itis.rds"))
+# # Find records with not-often used levels
+# infraorder_recs <- subgenus_recs <- subtribe_recs <- section_recs <- vector("numeric")
+# for(i in 1:length(spp_class_all)){
+#   if("infraorder" %in% spp_class_all[[i]]$rank) infraorder_recs <- c(infraorder_recs,i)
+#   if("subgenus" %in% spp_class_all[[i]]$rank) subgenus_recs <- c(subgenus_recs,i)
+#   if("subtribe" %in% spp_class_all[[i]]$rank) subtribe_recs <- c(subtribe_recs,i)
+#   if("section" %in% spp_class_all[[i]]$rank) section_recs <- c(section_recs,i)
+# }  # 20 
+# names(spp_class_all)[infraorder_recs]  # 622 species - widely spread across taxa. Keep
+# names(spp_class_all)[subgenus_recs]  # 39 insect species: inspect further
+# subgenus_check <- data.frame(family = NA, genus = NA, subgenus = NA)[0,]
+# for(i in subgenus_recs){
+#   reci <- spp_class_all[[i]]
+#   subgenus_check <- rbind(subgenus_check, data.frame(family = reci$name[reci$rank == "family"],
+#                                                      genus = reci$name[reci$rank == "genus"],
+#                                                      subgenus = reci$name[reci$rank == "subgenus"]))
+# }
+# unique(subgenus_check)[order(unique(subgenus_check)$family),]
+# # Only informative for two species of Culicidae (Culex and Aedes): remove.
+# names(spp_class_all)[subtribe_recs]  # 13 insect species: inspect further
+# subtribe_check <- data.frame(family = NA, tribe = NA, subtribe = NA)[0,]
+# for(i in subtribe_recs){
+#   reci <- spp_class_all[[i]]
+#   subtribe_check <- rbind(subtribe_check, data.frame(family = reci$name[reci$rank == "family"],
+#                                                      tribe = reci$name[reci$rank == "tribe"],
+#                                                      subtribe = reci$name[reci$rank == "subtribe"]))
+# }  # Uninformative: remove
+# names(spp_class_all)[section_recs]  # only 3 Hydrozetidae records. Remove.
+
+for(i in 1:length(spp_class_all)){
+  if("subgenus" %in% spp_class_all[[i]]$rank){
+    spp_class_all[[i]] <- spp_class_all[[i]][spp_class_all[[i]]$rank != "subgenus",]
+  }
+  if("subtribe" %in% spp_class_all[[i]]$rank){
+    spp_class_all[[i]] <- spp_class_all[[i]][spp_class_all[[i]]$rank != "subtribe",]
+  }
+  if("section" %in% spp_class_all[[i]]$rank){
+    spp_class_all[[i]] <- spp_class_all[[i]][spp_class_all[[i]]$rank != "section",]
+  }
+}
+
+```
+
+### Calculation of variants of phylogenetic correlation matrix
+
+Using the 200-species trial subset, we sampled the model "joinspp_pa_no_eps.stan" with 7 different versions of the phylogenetic correlation matrix $\mathbf{\Sigma}_{\text{phylo}}$. After @ovaskainen_etal_2017, this model calculates the phylogenetic covariance matrix, $\mathbf{L}_{\text{phylo_mixed}}$ used to structure species-response slopes, by linear decay of the correlation matrix with a rate parameter $\rho_{\text{phylo}}$  as:
+
+$$
+
+\mathbf{L}_{\text{phylo\_mixed}} = \text{cholesky\_decompose}(\rho_{\text{phylo}} \mathbf{\Sigma}_{\text{phylo}} + (1.0 - \rho_{\text{phylo}}) \mathbf{I}_{\text{taxa}})
+
+$$
+
+where ($\mathbf{I}_{\text{taxa}}$) is an independent species identity matrix. 
+
+The seven variants of the correlation matrix were:
+
+  1. Distances calculated as branch length with Brownian decay (using the ape::vcv() function);
+
+  2. As for variant 1 but with taxonomic ranks censored so that correlations between species more distantly related than order were set to zero;
+
+  3. As for variant 2 but censored above family rather than order;
+
+  4. Simple linear scaling of correlations between 0 and 1 (after @clarke_warwick_1998) from species to order;
+
+  5. As for variant 4, but scaled from species to family;
+
+  6. As for variant 5, but scaled from species to genus;
+
+  7. No phylogenetic correlation.
+
+The Brownian decay method is based on the Brownian model of trait evolution whereby trait variance increases linearly over time, to model the prediction that more closely related species have more similar traits [@cooper_etal_2016].  The Ornstein Uhlenbeck (OU) model is a variant of the Brownian model, originally used to model stabilizing selection in which traits are drawn toward a fitness optimum on an adaptive landscape [@lande_1976]. @cooper_etal_2016 advocated caution in using the OU model over the Brownian in part because of its greater complexity, with two additional parameters.  However, the joint species distribution model framework implicitly models the additional parameters, meaning only a single parameter, $\alpha_{\text{phylo}}$, is required to replace $\rho_{\text{phylo}}$ used in Brownian decay, thus:
+
+$$
+
+\mathbf{L}_{\text{phylo\_mixed}} = \text{cholesky\_decompose}( e^{(-2 \cdot \alpha_{\text{phylo}}(1 - \mathbf{\Sigma}_{\text{phylo}}))})
+
+$$
+
+The niche optimum parameter in the OU model, $\mu$, is equivalent to our model global mean parameters mu_beta_site and mu_beta_obs and the drift velocity, $\sigma$, is equivalent to our model's slope standard deviations scale_beta_site and scale_beta_obs.  $\alpha_{\text{phylo}}$, the exponent scaling the phylogenetic tree is equivalent to $\alpha$ the selection strength parameter, and evolutionary time is represented by the phylogenetic covariance matrix $\mathbf{\Sigma}_{\text{phylo}}$ itself. We thus applied an eighth variant to the \mathbf{L}_{\text{phylo_mixed}} calculation using the OU model, which required a slightly revised Stan model "jointspp_pa_no_eps_ou.stan", with an alpha_phylo parameter intead of a rho_phylo parameter.
+
+<!-- some text from @sharma_etal_2025 10.1016/j.tree.2025.04.010 to support the OU approach:
+The existing methods utilize the phylogenetic distance matrix to model the covariance between species-level environment coef cients, implicitly assuming that similarity in species–environment relationships is proportional to phylogenetic distance (Figure 3). This is a pattern expected only under the neutral expectation of niche evolution, described by a Brownian motion (BM) model, whereas there is mounting evidence that other patterns, such as niche conservatism (more similar than expected under BM) are common [59,68,69]. Therefore, for any general empirical application, there is a need to extend ‘phylogenetic SDMs’ beyond these models. For example, Thorson et al. [50] and Sharma et al. [70] proposed models that take the exible approach of rst estimating the phylogenetic autocorrelation across the phylogenetic distance before borrowing information (Figure 3). This allows the model to account for underlying evolutionary processes in addition to BM, such as a single-optimum Ornstein-Uhlenbeck (OU), which models stabilizing selection. OU models have also been used to investigate niche conservatism and adaptive hypotheses [71]. By taking this flexible approach, models do not place restrictive assumptions on the mode of evolution or the relationship between species’ niche similarity a priori (Figure 3). Further development of such models that can account for different evolutionary models – such as multi-optima OU models, early-burst models, relaxed BM, or patterns such as competitive exclusion – will continue to expand the range of processes captured and improve data-deficient species models.-->
+
+```{r}
+#| label: fig-spp_tree
+#| echo: true
+#| message: false
+#| warning: false
+#| fig-height: 7
+#| fig-width: 6
+#| fig-cap: "The taxonomic tree for the trial subset of 33 species modelled here" 
+
+# Make sure the taxonomic tree matrix is ordered the same as biota_1_ct
+spp_trial_1 <- spp_trial_1[match(colnames(biota_1_ct),spp_trial_1$taxoncode),]
+spp_class_200 <- spp_class_all[spp_trial_1$taxon]
+# Select the subset of taxa relevant for the current analysis (or use all 982 spp)
+spp_tree_1 <- taxize::class2tree(spp_class_200)
+# compute branch lengths to reflect evolutionary divergence
+spp_vcv <- ape::vcv(spp_tree_1$phylo, corr = TRUE)
+# par(mar = c(0,1,0,1)); plot(spp_tree_1, cex = 0.25)
+taxon_levels_200 <- spp_class_200[[1]]$rank
+for(i in 2:length(spp_class_200)){
+  taxon_levels_200 <- unique(c(taxon_levels_200, spp_class_200[[i]]$rank))
+}
+x <- unique(round(as.vector(spp_vcv),5))
+# plot(x[order(x)])
+# # It is not possible to assign the 17 correlation values in spp_vcv to taxonomic ranks
+# # as they are calculated on branch lengths of the input tree, hence the minor non-linearity
+
+
+# Scale the tree so total root-to-tip height is exactly 1.0
+spp_tree_1_raw <- spp_tree_1$phylo
+max_height <- max(ape::node.depth.edgelength(spp_tree_1_raw))
+scaled_tree <- spp_tree_1_raw
+scaled_tree$edge.length <- scaled_tree$edge.length / max_height
+spp_vcv_ou <- ape::vcv(scaled_tree)
+
+# 1. Remove all taxonomic ranks above order from the classification list and re-calculate 
+spp_class_200_to_order <- spp_class_200
+for(i in 1:length(spp_class_200_to_order)){
+  spp_class_200_to_order[[i]] <- 
+    spp_class_200_to_order[[i]][spp_class_200_to_order[[i]]$rank %in%
+                                  c("order","suborder","infraorder","family","subfamily","tribe","genus","species"),]
+}
+taxon_levels_200_to_order<- spp_class_200_to_order[[1]]$rank
+for(i in 2:length(spp_class_200_to_order)){
+  taxon_levels_200_to_order <- unique(c(taxon_levels_200_to_order, spp_class_200_to_order[[i]]$rank))
+}
+spp_tree_1 <- taxize::class2tree(spp_class_200_to_order)
+# compute branch lengths to reflect evolutionary divergence
+spp_vcv_to_order <- ape::vcv(spp_tree_1$phylo, corr = TRUE)
+x <- unique(round(as.vector(spp_vcv_to_order),5))
+# plot(x[order(x)])
+# Approximately linear from species to order, but then a large drop to zero for ranks above order
+
+spp_class_200_to_fam <- spp_class_200
+for(i in 1:length(spp_class_200_to_fam)){
+  spp_class_200_to_fam[[i]] <- 
+    spp_class_200_to_fam[[i]][spp_class_200_to_fam[[i]]$rank %in%
+                                  c("family","subfamily","tribe","genus","species"),]
+}
+taxon_levels_200_to_fam <- spp_class_200_to_fam[[1]]$rank
+for(i in 2:length(spp_class_200_to_fam)){
+  taxon_levels_200_to_fam <- unique(c(taxon_levels_200_to_fam, spp_class_200_to_fam[[i]]$rank))
+}
+spp_tree_1 <- taxize::class2tree(spp_class_200_to_fam)
+# compute branch lengths to reflect evolutionary divergence
+spp_vcv_to_fam <- ape::vcv(spp_tree_1$phylo, corr = TRUE)
+x <- unique(as.vector(spp_vcv_to_fam))
+# par(mar = c(4,4,1,1)) ; plot(x[order(x)])
+# And similarly to the vcv_to_order, roughly linear from species to family, and then a large drop to zerion
+
+# # Here we borrow from the taxonomic index of Clarke and Warwick (1998)
+# # with equally spaced correlation for taxonomic levels 
+#
+# # #  A. species to genus
+taxonomy_df <- data.frame(species = spp_trial_1$taxon, genus = NA)
+for(i in 1:nrow(taxonomy_df)) {
+  spi <- spp_trial_1$taxon[i]
+  spi_df <- spp_class_200[[spi]]
+  if (!is.null(spi_df)) {
+    t_match <- spi_df$name[spi_df$rank == "genus"]
+    taxonomy_df$genus[i] <- if(length(t_match) > 0) t_match[1] else paste0("unknown_gen_", i)
+  } else {
+    taxonomy_df$genus[i] <- paste0("unresolved_gen_", i)
+  }
+}
+
+taxonomic_cor <- matrix(0, nrow = nrow(spp_trial_1), ncol = nrow(spp_trial_1))
+rownames(taxonomic_cor) <- taxonomy_df$species
+colnames(taxonomic_cor) <- taxonomy_df$species
+for (i in 1:nrow(spp_trial_1)) {
+  for (j in 1:nrow(spp_trial_1)) {
+    if (i == j) {
+      taxonomic_cor[i, j] <- 1.00 # Self-correlation
+    } else if (taxonomy_df$genus[i] == taxonomy_df$genus[j] && !grepl("unknown", taxonomy_df$genus[i])) {
+      taxonomic_cor[i, j] <- 0.50 # genus-genus pairs
+    } else {
+      taxonomic_cor[i, j] <- 0.00 # Anything higher than family is zero
+    }
+  }
+}
+# Matrix validation for Stan's Cholesky factorisation
+spp_vcv_wc_g <- as.matrix(Matrix::nearPD(taxonomic_cor, corr = TRUE)$mat)
+
+# # #  B. species to family
+taxonomy_df <- data.frame(species = spp_trial_1$taxon, genus = NA,
+                          tribe = NA, subfamily = NA, family = NA)
+for(i in 1:nrow(taxonomy_df)) {
+  spi <- spp_trial_1$taxon[i]
+  spi_df <- spp_class_200[[spi]]
+  if (!is.null(spi_df)) {
+    t_match <- spi_df$name[spi_df$rank == "genus"]
+    taxonomy_df$genus[i] <- if(length(t_match) > 0) t_match[1] else paste0("unknown_gen_", i)
+    t_match <- spi_df$name[spi_df$rank == "tribe"]
+    taxonomy_df$tribe[i] <- if(length(t_match) > 0) t_match[1] else paste0("unknown_tribe_", i)
+    t_match <- spi_df$name[spi_df$rank == "subfamily"]
+    taxonomy_df$subfamily[i] <- if(length(t_match) > 0) t_match[1] else paste0("unknown_subfam_", i)
+    t_match <- spi_df$name[spi_df$rank == "family"]
+    taxonomy_df$family[i] <- if(length(t_match) > 0) t_match[1] else paste0("unknown_fam_", i)
+  } else {
+    taxonomy_df$genus[i] <- paste0("unresolved_gen_", i)
+    taxonomy_df$tribe[i] <- paste0("unresolved_tribe_", i)
+    taxonomy_df$subfamily[i] <- paste0("unresolved_subfam_", i)
+    taxonomy_df$family[i] <- paste0("unresolved_fam_", i)
+  }
+}
+
+taxonomic_cor <- matrix(0, nrow = nrow(spp_trial_1), ncol = nrow(spp_trial_1))
+rownames(taxonomic_cor) <- taxonomy_df$species
+colnames(taxonomic_cor) <- taxonomy_df$species
+for (i in 1:nrow(spp_trial_1)) {
+  for (j in 1:nrow(spp_trial_1)) {
+    if (i == j) {
+      taxonomic_cor[i, j] <- 1.00 # Self-correlation
+    } else if (taxonomy_df$genus[i] == taxonomy_df$genus[j] && !grepl("unknown", taxonomy_df$genus[i])) {
+      taxonomic_cor[i, j] <- 0.80 # genus-genus pairs
+    } else if (taxonomy_df$tribe[i] == taxonomy_df$tribe[j] && !grepl("unknown", taxonomy_df$tribe[i])) {
+      taxonomic_cor[i, j] <- 0.60 # tribe-tribe pairs
+    } else if (taxonomy_df$subfamily[i] == taxonomy_df$subfamily[j] && !grepl("unknown", taxonomy_df$subfamily[i])) {
+      taxonomic_cor[i, j] <- 0.40 # subfamily-subfamily pairs
+    } else if (taxonomy_df$family[i] == taxonomy_df$family[j] && !grepl("unknown", taxonomy_df$family[i])) {
+      taxonomic_cor[i, j] <- 0.20 # family-family pairs
+    } else {
+      taxonomic_cor[i, j] <- 0.00 # Anything higher than family is zero
+    }
+  }
+}
+# Matrix validation for Stan's Cholesky factorisation
+spp_vcv_wc_f <- as.matrix(Matrix::nearPD(taxonomic_cor, corr = TRUE)$mat)
+
+# # #  C. species to order
+taxonomy_df <- data.frame(species = spp_trial_1$taxon, genus = NA,
+                          tribe = NA, subfamily = NA, family = NA, order = NA)
+for(i in 1:nrow(taxonomy_df)) {
+  spi <- spp_trial_1$taxon[i]
+  spi_df <- spp_class_200[[spi]]
+  if (!is.null(spi_df)) {
+    t_match <- spi_df$name[spi_df$rank == "genus"]
+    taxonomy_df$genus[i] <- if(length(t_match) > 0) t_match[1] else paste0("unknown_gen_", i)
+    t_match <- spi_df$name[spi_df$rank == "tribe"]
+    taxonomy_df$tribe[i] <- if(length(t_match) > 0) t_match[1] else paste0("unknown_tribe_", i)
+    t_match <- spi_df$name[spi_df$rank == "subfamily"]
+    taxonomy_df$subfamily[i] <- if(length(t_match) > 0) t_match[1] else paste0("unknown_subfam_", i)
+    t_match <- spi_df$name[spi_df$rank == "family"]
+    taxonomy_df$family[i] <- if(length(t_match) > 0) t_match[1] else paste0("unknown_fam_", i)
+    t_match <- spi_df$name[spi_df$rank == "order"]
+    taxonomy_df$order[i] <- if(length(t_match) > 0) t_match[1] else paste0("unknown_order_", i)
+  } else {
+    taxonomy_df$genus[i] <- paste0("unresolved_gen_", i)
+    taxonomy_df$tribe[i] <- paste0("unresolved_tribe_", i)
+    taxonomy_df$subfamily[i] <- paste0("unresolved_subfam_", i)
+    taxonomy_df$family[i] <- paste0("unresolved_fam_", i)
+    taxonomy_df$order[i] <- paste0("unresolved_order_", i)
+  }
+}
+
+taxonomic_cor <- matrix(0, nrow = nrow(spp_trial_1), ncol = nrow(spp_trial_1))
+rownames(taxonomic_cor) <- taxonomy_df$species
+colnames(taxonomic_cor) <- taxonomy_df$species
+for (i in 1:nrow(spp_trial_1)) {
+  for (j in 1:nrow(spp_trial_1)) {
+    if (i == j) {
+      taxonomic_cor[i, j] <- 1.00 # Self-correlation
+    } else if (taxonomy_df$genus[i] == taxonomy_df$genus[j] && !grepl("unknown", taxonomy_df$genus[i])) {
+      taxonomic_cor[i, j] <- 0.8333333 # genus-genus pairs
+    } else if (taxonomy_df$tribe[i] == taxonomy_df$tribe[j] && !grepl("unknown", taxonomy_df$tribe[i])) {
+      taxonomic_cor[i, j] <- 0.6666667 # tribe-tribe pairs
+    } else if (taxonomy_df$subfamily[i] == taxonomy_df$subfamily[j] && !grepl("unknown", taxonomy_df$subfamily[i])) {
+      taxonomic_cor[i, j] <- 0.5000000 # subfamily-subfamily pairs
+    } else if (taxonomy_df$family[i] == taxonomy_df$family[j] && !grepl("unknown", taxonomy_df$family[i])) {
+      taxonomic_cor[i, j] <- 0.3333333 # family-family pairs
+    } else if (taxonomy_df$order[i] == taxonomy_df$order[j] && !grepl("unknown", taxonomy_df$order[i])) {
+      taxonomic_cor[i, j] <- 0.1666667 # order-order pairs
+    } else {
+      taxonomic_cor[i, j] <- 0.00 # Anything higher than family is zero
+    }
+  }
+}
+# Matrix validation for Stan's Cholesky factorisation
+spp_vcv_wc_o <- as.matrix(Matrix::nearPD(taxonomic_cor, corr = TRUE)$mat)
+
+```
+
+### Models
+
+```{r}
+#| eval: false
+
+pred_site <- c("I","F","Q","Q2","C","D","T","B","L","F_I","Q_F","Q_I")
+pred_obs <- c("riff","season") # included in all candidate models
+
+ # "ifqcdtblrs_fi_qf_qi_spp_vcv_to_order" # ape::vcv() using taxonomic tree censored to order
+master_data$phylo_cor <- spp_vcv_to_order
+run_200spp_model(pred_site = pred_site,
+                 mod_code = "ifqcdtblrs_fi_qf_qi_spp_vcv_to_order")
+
+# "ifqcdtblrs_fi_qf_qi_spp_vcv_to_fam" # ape::vcv() using taxonomic tree censored to family
+master_data$phylo_cor <- spp_vcv_to_fam
+run_200spp_model(pred_site = pred_site,
+                 mod_code = "ifqcdtblrs_fi_qf_qi_spp_vcv_to_fam")
+
+# "ifqcdtblrs_fi_qf_qi_spp_vcv_wc_f" # Warwick and Clarke approach to family
+master_data$phylo_cor <- spp_vcv_wc_f
+run_200spp_model(pred_site = pred_site,
+                 mod_code = "ifqcdtblrs_fi_qf_qi_spp_vcv_wc_f")
+
+# "ifqcdtblrs_fi_qf_qi_spp_vcv_wc_o" # Warwick and Clarke approach to order
+master_data$phylo_cor <- spp_vcv_wc_o
+run_200spp_model(pred_site = pred_site,
+                 mod_code = "ifqcdtblrs_fi_qf_qi_spp_vcv_wc_o")
+
+# "ifqcdtblrs_fi_qf_qi_spp_vcv_wc_g" # Warwick and Clarke approach to genus
+master_data$phylo_cor <- spp_vcv_wc_g
+run_200spp_model(pred_site = pred_site,
+                 mod_code = "ifqcdtblrs_fi_qf_qi_spp_vcv_wc_g")
+
+# "ifqcdtblrs_fi_qf_qi_spp_vcv"  # ape::vcv() using full taxonomic tree
+master_data$phylo_cor <- spp_vcv
+run_200spp_model(pred_site = pred_site,
+                 mod_code = "ifqcdtblrs_fi_qf_qi_spp_vcv")
+
+# "ifqcdtblrs_fi_qf_qi_no_phylo"  # ape::vcv() using full taxonomic tree
+# Remove phylogeny by making phylo_cor an identity matrix
+master_data$phylo_cor <- diag(master_data$n_taxa)
+run_200spp_model(pred_site = pred_site,
+                 mod_code = "ifqcdtblrs_fi_qf_qi_no_phylo")
+
+# "ifqcdtblrs_fi_qf_qi_ou" # using Ornstein-Uhlenbeck
+master_data$phylo_cor <- spp_vcv_ou
+params_to_summarise[params_to_summarise == "rho_phylo"] <- "alpha_phylo"
+run_200spp_model(pred_site = pred_site,
+                 mod_code = "ifqcdtblrs_fi_qf_qi_ou",
+                 mod_path = "stancode/jointspp_pa_no_eps_ou.stan")
+params_to_summarise[params_to_summarise == "alpha_phylo"] <- "rho_phylo"
+
+```
+
+All models converged well with no divergences or exceedences of tree depth (@tbl-diagnostics).  Minimum Effective sample sizes were smaller and maxium Rhat were higher than optimal in all cases because of the unconstrained latent factor ordinations, which are corrected for in *another document*.  Excluding those parameters shows that the minimum effective sample sizes were more satisfactory for all other parameters in the model, with the model using OU sampling more efficiently than any others.
+
+```{r}
+#| label: tbl-diagnostics
+#| tbl-cap: "Stan diagnostics for all 8 model variants. In all cases the models had 4 chains with 1200 iterations per chain."
+
+mod_dir <- "~/uomShare/wergStaff/ChrisW/git-data/mw_metabarcoding_model/trial_200spp_models/"
+
+phylo_mods <- data.frame(mod_no = c(1:8),
+                         desc = c("Ornstein-Uhlenbeck branch-length decay",
+                                  "Brownian motion branch-length censored to order",
+                                  "Brownian motion branch-length censored to family",
+                                  "Warwick & Clarke rank (to genus)-based distance",
+                                  "Warwick & Clarke rank (to family)-based distance",
+                                  "Warwick & Clarke rank (to order)-based distance",
+                                  "Brownian motion branch-length",
+                                  "No phylogenetic correlation"),
+                         mod_code = c("ifqcdtblrs_fi_qf_qi_ou",
+                                      "ifqcdtblrs_fi_qf_qi_spp_vcv_to_order",
+                                      "ifqcdtblrs_fi_qf_qi_spp_vcv_to_fam",
+                                      "ifqcdtblrs_fi_qf_qi_spp_vcv_wc_g",
+                                      "ifqcdtblrs_fi_qf_qi_spp_vcv_wc_f",
+                                      "ifqcdtblrs_fi_qf_qi_spp_vcv_wc_o",
+                                      "ifqcdtblrs_fi_qf_qi_spp_vcv", 
+                                      "ifqcdtblrs_fi_qf_qi_no_phylo"),
+                         tab_header = c("OU","Brwn to order","Brwn to family","W&C rank to genus",
+                                        "W&C rank to family","W&C rank to order","Brwn full taxonomy",
+                                        "No phylo"))
+
+# Distance based on discrete taxonomic ranks; Linear scaling (rho); exponential decay (alpha)
+
+# diag_tables <- list()
+# for(i in 1:nrow(phylo_mods)){
+#   diag_tables[[i]] <- compile_model_diagnostics(phylo_mods$mod_code[i], mod_dir = mod_dir)
+#   names(diag_tables)[i] <- phylo_mods$mod_code[i]
+# }
+# 
+# for(i in 1:nrow(phylo_mods)){
+# summary <-  load_model_component_bundle(mod_code = phylo_mods$mod_code[i],
+#                                    mod_dir = mod_dir)$summary
+# summary_non_z <- summary[!grepl("z|lambda",summary$variable),]
+# min_ess_bulk <- summary_non_z$ess_bulk[order(summary_non_z$ess_bulk)][1]
+# min_ess_tail <- summary_non_z$ess_tail[order(summary_non_z$ess_tail)][1]
+# lwsp <- summary_non_z$variable[which(summary_non_z$ess_bulk == min_ess_bulk)]
+# diag_tables[[i]] <- rbind(diag_tables[[i]], data.frame(spec = c("Min.non-latent Bulk ESS",
+#                                                                "Min.non-latent Bulk ESS",
+#                                                                "Worst non-latent parameter"),
+#                                   value = c(round(min_ess_bulk), round(min_ess_tail), lwsp)))
+# }
+# 
+# save(diag_tables, file = "~/uomShare/wergStaff/ChrisW/temp/vcv_phylo_model_diag_tables_list.rda")
+load("~/uomShare/wergStaff/ChrisW/temp/vcv_phylo_model_diag_tables_list.rda")
+diag_tab <- diag_tables[[1]]
+for(i in 2:length(diag_tables)){
+  add_tab <- diag_tables[[i]]
+  # correct errors in table compilation
+  add_tab$spec[add_tab$spec == "BFMI (chain 1)"][2] <- "BFMI (chain 2)"
+  add_tab$spec[add_tab$spec == "Min.non-latent Bulk ESS"][2] <- "Min.non-latent Tail ESS"
+  if(sum(duplicated(add_tab$spec)) > 0)
+    add_tab <- add_tab[-(18:21),]
+  diag_tab <- cbind(diag_tab, add_tab[,-1])
+}
+diag_tab <- diag_tab[-(1:6),]
+names(diag_tab)[-1] <- phylo_mods$tab_header
+ft_to_word(flextable::flextable(diag_tab))
+
+```
+
+```{r}
+
+# loo_list <- list()
+# for(i in 1:nrow(phylo_mods)){
+#  loo_list[[i]] <-  load_model_component_bundle(mod_code = phylo_mods$mod_code[i],
+#                                    mod_dir = mod_dir)$loo
+#  names(loo_list)[i] <- phylo_mods$desc[i]
+# }
+# loo_comparison <- loo::loo_compare(loo_list)
+# loo_comparison <- data.frame(model = row.names(loo_comparison),
+#                              loo_comparison, row.names = NULL)
+# save(loo_comparison, file = "~/uomShare/wergStaff/ChrisW/temp/vcv_phylo_loo_comparison.rda")
+
+load("~/uomShare/wergStaff/ChrisW/temp/vcv_phylo_loo_comparison.rda")
+loo_comparison[,-1] <- round(loo_comparison[,-1],1)
+ft_to_word(flextable::flextable(loo_comparison))
+```
+
+The LOO-IC comparisons between models should be interpreted with caution as the loo results of all models had a small (<2%) number of Pareto ks > 0.7, and I do not yet have the computing power to re-calculate them with moment-matching.  Nevertheless, the comparisons do demonstrate that the model using Brownian and the model using OU, both on the full taxonomy were equally plausible. All other models were arguably also equally plausible, but the model with no phylogenetic correlation has an elpd_diff 3.5 times se_diff lower than the best model, suggesting that the top two models at least are more plausible.
+
+The OU model is the preferable model because it sampled more efficiently, and OU has a stronger theoretical basis of OU over Brownian [@sharma_etal_2025].  Mean $\alpha_{phylo}$ was 6.7 (95% confidence intervals 5.4,8.3).  From this, and the correlation values between species from the phylogenetic covariance matrix $\mathbf{\Sigma}_{\text{phylo}}$, we can find the predicted correlation between species sharing different taxonomic ranks (@fig-corr_by_rank).  
+
+This suggests only a moderate correlation between species sharing the same genus or tribe, with little correlation between species sharing subfamilies or families, and near-zero correlation between species sharing orders. This suggests substantial evolutionary drift in niches within families suggesting substantial noise in models based on family-level taxonomy.
+
+It remains possible that these correlation values will change when the model is applied to the full 883 species in the dataset.
+
+```{r}
+#| label: "fig-corr_by_rank"
+#| fig-width: 5
+#| fig-height: 5
+#| fig-cap: "Predicted mean correlation (points) between species sharing a common taxonomic rank, with 80%  and 95% confidence limits (thick lines and think lines respectively"
+
+# # Congenerics (e.g Oecetis)  corr = 0.9114853
+# spp_vcv_ou[grep("Oecetis", row.names(spp_vcv_ou)), grep("Oecetis", colnames(spp_vcv_ou))]
+# # Same tribe corr (e.g Chironomini)= 0.8870648
+# spp_vcv_ou[grep("Chironomus|Polypedilum", row.names(spp_vcv_ou)), grep("Chironomus|Polypedilum", colnames(spp_vcv_ou))]
+# # Same subfamily (e.g. Chiornominae) corr = 0.8157158
+# spp_vcv_ou[grep("Conochironomus|Polypedilum", row.names(spp_vcv_ou)), grep("Conochironomus|Polypedilum", colnames(spp_vcv_ou))]
+# # Confamilials e.g Tateidae, Hydropsychidae corr =  0.7521885
+# spp_vcv_ou[grep("pyrgus", row.names(spp_vcv_ou)), grep("pyrgus", colnames(spp_vcv_ou))]
+# spp_vcv_ou[grep("Cheumatopsyche|Asmicridea", row.names(spp_vcv_ou)), grep("Cheumatopsyche|Asmicridea", colnames(spp_vcv_ou))]
+# # Same order e.g Plecoptera = 0.5720539
+# spp_vcv_ou[grep("Dinotoperla|Cosmioperla", row.names(spp_vcv_ou)), grep("Dinotoperla|Cosmioperla", colnames(spp_vcv_ou))]
+# # Interpret the alpha_phylo value
+
+fit <- load_model_component_bundle(mod_code = phylo_mods$mod_code[1],mod_dir = mod_dir)$fit
+alpha_draws <- fit$draws(variables = "alpha_phylo")
+# mean(alpha_draws) # 6.717513; 
+# quantile(alpha_draws, probs = c(0.025,0.975)) # 5.387890 8.253598 
+
+corrs_by_rank <- data.frame(common_rank = c("genus","tribe","subfamily","family","order"),
+                            phylo_cor = c(0.9114853,0.8870648,0.8157158,0.7521885,0.5720539),
+                            mean = NA, cl_025 = NA, cl_100 = NA, cl_900 = NA, cl_975 = NA)
+for(i in 1:nrow(corrs_by_rank)){
+  corri <- exp(-2 * alpha_draws * (1- corrs_by_rank$phylo_cor[i]))
+  corrs_by_rank$mean[i] <- mean(corri)
+  corrs_by_rank[i,4:7] <- quantile(corri, probs = c(0.025, 0.1, 0.9, 0.975))
+}
+
+plot(1:5, corrs_by_rank$mean, ylim = c(0,0.4), xlim = c(0.5,5.5), 
+     axes = FALSE, xlab = "Common taxonomic rank", 
+     ylab = "Correlation between related species") 
+for(i in 1:nrow(corrs_by_rank)){
+  lines(c(i,i),c(corrs_by_rank$cl_025[i], corrs_by_rank$cl_975[i]))
+  lines(c(i,i),c(corrs_by_rank$cl_100[i], corrs_by_rank$cl_900[i]), lwd = 3)
+}
+points(1:5, corrs_by_rank$mean, pch = 21, bg = "grey", cex = 1.5)
+axis(1, at = 1:5, labels = corrs_by_rank$common_rank); axis(2, las = 1); box(bty = 'l')
+```
+
+

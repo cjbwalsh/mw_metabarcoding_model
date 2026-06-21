@@ -62,10 +62,11 @@ compile_model_diagnostics <- function(mod_code,
   # ESS
   if("summary" %in% names(mod_bundle)){
     mod_summary <- mod_bundle$summary
-    s_tab1 <- data.frame(spec = c("Min. Bulk ESS","Min. Tail ESS",
+    s_tab1 <- data.frame(spec = c("Min. Bulk ESS","Min. Tail ESS","Max Rhat",
                                   "Least well-sampled parameter"),
                          value = c(round(min(mod_summary$ess_bulk, na.rm = TRUE)),
                                    round(min(mod_summary$ess_tail, na.rm = TRUE)),
+                                   round(max(mod_summary$rhat, na.rm = TRUE),2),
                                    mod_summary$variable[
                                      which(mod_summary$ess_bulk == min(mod_summary$ess_bulk, na.rm = TRUE))]))
     out_tab <- rbind(out_tab, s_tab1)
@@ -73,3 +74,13 @@ compile_model_diagnostics <- function(mod_code,
   out_tab
 }
 
+base_traceplot <- function(param_draws, param_name = "Unspecified parameter"){
+  colpal <- RColorBrewer::brewer.pal(4,"PuOr")
+  plot(param_draws[,1,], type = "l", col = colpal[1], axes = FALSE,
+       ylim = range(param_draws,na.rm=TRUE), xlab = "Iteration", 
+       ylab = param_name)
+  for(i in 2:dim(param_draws)[2]){
+    lines(param_draws[,i,], col = colpal[i])
+  }
+  axis(1);axis(2, las = 1); box(bty = "l")
+}
