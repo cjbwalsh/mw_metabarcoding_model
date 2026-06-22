@@ -27,7 +27,8 @@ parameters {
   matrix[n_obs_pred, n_taxa] beta_obs_raw;       
   vector<lower=0>[n_obs_pred] scale_beta_obs;    
   
-  // strength of phylogenetic influence on betas (exponential decay parameter for Ornstein-Uhlenbeck divergence)
+  // strength of phylogenetic influence on betas (exponential decay parameter 
+  // for Ornstein-Uhlenbeck divergence)
   real<lower=0, upper=20> alpha_phylo; 
 
   // Latent variables
@@ -43,20 +44,21 @@ parameters {
   // Taxon intercept
   vector[n_taxa] a_taxon_raw;                 
   real mu_taxon;                              
-  real<lower=0> sigma_taxon;             // Added variance tracking for taxon intercepts
+  real<lower=0> sigma_taxon; 
 
 }
 
 transformed parameters {
-  // 1. Non-Centered Phylogenetic Regression Slopes
+  // Non-centred Regression Slopes
   matrix[n_site_pred, n_taxa] beta_site;
   matrix[n_obs_pred, n_taxa] beta_obs;
   vector[n_taxa] a_taxon;
   
+  // Non-centred latent factors
   matrix[n_taxa, n_latent] lambda;
   matrix[n_obs, n_latent] z_expanded;
 
-  // Non-Centered Transformations for Hierarchical Variances
+  // Non-centered transformations for hierarchical variances
   a_taxon = mu_taxon + a_taxon_raw * sigma_taxon;
 
   lambda = lambda_raw * sigma_lambda;
@@ -74,17 +76,17 @@ transformed parameters {
     }
    L_phylo_mixed = cholesky_decompose(sigma_ou);
 
-    // Match site-level slopes to the mixed tree
+    // Match site-level slopes to the mixed phylogenetic tree
     beta_site = rep_matrix(mu_beta_site, n_taxa) + 
                 (diag_pre_multiply(scale_beta_site, L_Omega_site) * beta_site_raw * L_phylo_mixed);
-    // Match sample-level slopes to the exact same mixed tree
+    // Match sample-level slopes to the same tree
     beta_obs = rep_matrix(mu_beta_obs, n_taxa) + 
                (diag_pre_multiply(scale_beta_obs, L_Omega_obs) * beta_obs_raw * L_phylo_mixed);
   }
 }
 
 model {
-  // --- Priors for the betas ---
+  // Priors for the betas
   to_vector(beta_site_raw) ~ std_normal();
   mu_beta_site ~ normal(0, 2);
   scale_beta_site ~ normal(0, 2);
@@ -95,26 +97,26 @@ model {
   scale_beta_obs ~ normal(0, 2);
   L_Omega_obs ~ lkj_corr_cholesky(2.0); 
 
+  // Priors for taxon intercepts
   mu_taxon ~ normal(0, 3);                
   a_taxon_raw ~ std_normal();             
-  sigma_taxon ~ normal(0, 1.5);
+  sigma_taxon ~ normal(1, 0.1);  # tight around mean 1 to...Tom justification?
   
-  // --- Latent Factor Priors ---
-  to_vector(z_raw) ~ std_normal();      // Restricts site coordinates to standard normal space
-  to_vector(lambda_raw) ~ std_normal(); // Restricts species loadings to standard normal space
-  // Regularising priors on the scales to keep the logit linear predictors stable
-  // Tight half-normal priors act as an L2 penalty to keep the geometry clean
+  // Priors for latent factors
+  to_vector(z_raw) ~ std_normal();      
+  to_vector(lambda_raw) ~ std_normal(); 
+  // Tight half-normal priors required for stability
   sigma_z ~ normal(0, 0.5);      
   sigma_lambda ~ normal(0, 0.5); 
   
+  // Prior for phylogenetic covariance strength
   alpha_phylo ~ normal(0, 5);
 
   // by declaring U_site_expanded and mu inside these braces, they are not saved in the model fit.
   {
     matrix[n_obs, n_taxa] mu;      
-    matrix[n_obs, n_site_pred] U_site_expanded = u_site[site]; // Optimization block
+    matrix[n_obs, n_site_pred] U_site_expanded = u_site[site]; 
 
-    // Compile mu column-by-column using your corrected mathematical orientation
     for (j in 1:n_taxa) {
       mu[, j] = a_taxon[j] +                          // Intercept for species j
                 (U_site_expanded * col(beta_site, j)) +  // Site predictor effects
@@ -133,6 +135,8 @@ generated quantities {
   vector[n_obs * n_taxa] log_lik;                   // Flattened log-likelihood
   vector[n_taxa] tjurs_r2_total;                    // Explanatory strength of the full model
   vector[n_taxa] tjurs_r2_env;                      // Explanatory strength using only fixed predictors 
+  matrix[n_obs, n_taxa] p_total_out;                // For calculation of full-model AUC in R
+  matrix[n_obs, n_taxa] p_env_out;                  // For calculation of AUC using only fixed predictors in R
  
   {
     matrix[n_obs, n_taxa] mu;
@@ -159,6 +163,9 @@ generated quantities {
       for (i in 1:n_obs) {
         real p_total = inv_logit(mu[i, j]);
         real p_env   = inv_logit(mu_env[i, j]);
+        
+        p_total_out[i, j] = p_total;
+        p_env_out[i, j]   = p_env;
         
         y_rep[i, j] = bernoulli_rng(p_total); 
         log_lik[idx] = bernoulli_logit_lpmf(y[i, j] | mu[i, j]);
