@@ -46,7 +46,7 @@ parameters {
   // Taxon intercept
   vector[n_taxa] a_taxon_raw;                 
   real mu_taxon;                              
-  real<lower=0> sigma_taxon;             // Added variance tracking for taxon intercepts
+  real<lower=0> sigma_taxon;  
 
 }
 
@@ -58,7 +58,7 @@ transformed parameters {
   
   matrix[n_taxa, n_latent] lambda;
   matrix[n_obs, n_latent] z_expanded;
-   // 1. NATIVELY STITCH THE IDENTIFIABLE LOWER-TRIANGULAR MATRIX
+   // NATIVELY STITCH THE IDENTIFIABLE LOWER-TRIANGULAR MATRIX
     // Row 1: Species 1 loads ONLY on Axis 1 (Axis 2 is forced to exactly 0.0)
     lambda[1, 1] = lambda_diag[1] * sigma_lambda;
     lambda[1, 2] = 0.0; 
@@ -87,10 +87,10 @@ transformed parameters {
     }
    L_phylo_mixed = cholesky_decompose(sigma_ou);
 
-    // Match site-level slopes to the mixed tree
+    // Match site-level slopes to the mixed phylogenetic tree
     beta_site = rep_matrix(mu_beta_site, n_taxa) + 
                 (diag_pre_multiply(scale_beta_site, L_Omega_site) * beta_site_raw * L_phylo_mixed);
-    // Match sample-level slopes to the exact same mixed tree
+    // Match sample-level slopes to the same tree
     beta_obs = rep_matrix(mu_beta_obs, n_taxa) + 
                (diag_pre_multiply(scale_beta_obs, L_Omega_obs) * beta_obs_raw * L_phylo_mixed);
   }
@@ -113,9 +113,8 @@ model {
   sigma_taxon ~ normal(0, 1.5);
   
   // --- Latent Factor Priors ---
-  to_vector(z_raw) ~ std_normal();      // Restricts site coordinates to standard normal space
-  // Regularising priors on the scales to keep the logit linear predictors stable
-  // Tight half-normal priors act as an L2 penalty to keep the geometry clean
+  to_vector(z_raw) ~ std_normal(); 
+  // Tight half-normal priors for stability
   sigma_z ~ normal(0, 0.5);      
   sigma_lambda ~ normal(0, 0.5); 
   

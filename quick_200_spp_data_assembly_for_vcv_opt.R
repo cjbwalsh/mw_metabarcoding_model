@@ -164,16 +164,11 @@ sites$lowness[sites$elev < 15] <- 0
 sites$lowness[sites$elev < 7.5] <- 0.5
 sites$lowness[sites$elev < 2.5] <- 1
 
-# Transformations and interactions prior to scaling
+# Transformations prior to scaling
 sites$lcarea <- log(sites$carea_km2)
 sites$smeanq <- sites$meanq^0.5
 sites$dor1 <- pmin(sites$dor,1)
 sites$lei <- log(sites$ei + 0.001)
-sites$q_af <- sites$smeanq * sites$af
-sites$q_ei <- sites$smeanq * sites$lei
-sites$b_ei <- sites$basalt * sites$lei
-sites$q_d <- log(sites$smeanq * sites$dor1 + 0.1)
-sites$af_ei <- sites$af * sites$lei
 
 ####
 
@@ -200,22 +195,20 @@ C <- scale(sites$lcarea)
 T <- scale(sites$meant)
 D <- scale(sites$dor1)
 B <- scale(sites$basalt)
-Q_F <- scale(sites$q_af)
-Q_I <- scale(sites$q_ei)
-Q_D <- scale(sites$q_d)
-F_I <- scale(sites$af_ei)
-B_I <- scale(sites$b_ei)
+Q_F <- Q * F  
+Q_I <- Q * I  
+Q_D <- Q * D
+F_I <- F * I
+B_I <- B * I
 L <- sites$lowness
 
 # Save scaling attributes for all scaled parameters
 pred_specs <- data.frame(db_name = c("ei_l44_sw1942_2022","af_l5_w633_2022","meanq_mm","meanq_mm","carea_km2","dor_2010","meant_y30_2022",
-                                     "elev_asl_m","basalt","ei*af","meanq*af","meanq*ei","basalt*ei","meanq*dor"),
-                         short_name = c("ei","af","meanq","meanq2","carea_km2","dor","meant","lowness","c_basalt",
-                                        "if","qf","qi","bi","qd"),
-                         transf_name = c("lei","af","smeanq","meanq","lcarea","dor1","meant","lowness","basalt",
-                                         "af_ei","q_af","q_ei","b_ei","q_d"),
-                         transformation = c("log(x+0.001)",NA,"x^0.5",NA,"log(x)","pmin(x,1)",NA,"bespoke scale",NA,"lei*af","smeanq*af","smeanq*lei","basalt*lei","log(smeanq*dor1+0.1"),
-                         scaled_name = c("I","F","Q","Q2","C","D","T","L","B","F_I","Q_F","Q_I","B_I","Q_D"),
+                                     "elev_asl_m","basalt"),
+                         short_name = c("ei","af","meanq","meanq2","carea_km2","dor","meant","lowness","c_basalt"),
+                         transf_name = c("lei","af","smeanq","meanq","lcarea","dor1","meant","lowness","basalt"),
+                         transformation = c("log(x+0.001)",NA,"x^0.5",NA,"log(x)","pmin(x,1)",NA,"bespoke scale",NA),
+                         scaled_name = c("I","F","Q","Q2","C","D","T","L","B"),
                          scale = NA, center = NA)
 
 for(i in 1:nrow(pred_specs)){
@@ -317,7 +310,7 @@ log_lik_matrix <- model_fit$draws(variables = "log_lik", format = "draws_matrix"
 n_chains <- posterior::nchains(log_lik_matrix)
 n_draws <- posterior::ndraws(log_lik_matrix)
 r_eff <- posterior::ess_bulk(log_lik_matrix) / (n_draws / n_chains)
-mod_loo <- loo::loo(log_lik_matrix, r_eff = r_eff, cores = 2) # 4 cores sails too close to the wind o 64 Gb RAM machine
+mod_loo <- loo::loo(log_lik_matrix, r_eff = r_eff, cores = 1) # 4 cores sails too close to the wind o 64 Gb RAM machine
 mod_bundle$loo <- mod_loo
 saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
 rm(mod_bundle,mod_summary, model_fit, mod_loo, log_lik_matrix, r_eff); gc()

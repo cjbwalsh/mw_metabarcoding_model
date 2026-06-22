@@ -76,7 +76,8 @@ for(i in 1:length(spp_class_all)){
     spp_class_all[[i]] <- spp_class_all[[i]][spp_class_all[[i]]$rank != "section",]
   }
 }
-
+spp_class_all_inf <- spp_class_all
+saveRDS(spp_class_all_inf, file = "~/uomShare/wergStaff/ChrisW/git-data/mw_metabarcoding_model/spp_class_all_inf.rds")
 ```
 
 ### Calculation of variants of phylogenetic correlation matrix
@@ -129,6 +130,7 @@ The existing methods utilize the phylogenetic distance matrix to model the covar
 #| fig-width: 6
 #| fig-cap: "The taxonomic tree for the trial subset of 33 species modelled here" 
 
+spp_class_all <- readRDS("~/uomShare/wergStaff/ChrisW/git-data/mw_metabarcoding_model/spp_class_all_inf.rds")
 # Make sure the taxonomic tree matrix is ordered the same as biota_1_ct
 spp_trial_1 <- spp_trial_1[match(colnames(biota_1_ct),spp_trial_1$taxoncode),]
 spp_class_200 <- spp_class_all[spp_trial_1$taxon]
@@ -477,6 +479,7 @@ It remains possible that these correlation values will change when the model is 
 
 # # Congenerics (e.g Oecetis)  corr = 0.9114853
 # spp_vcv_ou[grep("Oecetis", row.names(spp_vcv_ou)), grep("Oecetis", colnames(spp_vcv_ou))]
+spp_vcv_ou[grep("Aedes", row.names(spp_vcv_ou)), grep("Aedes", colnames(spp_vcv_ou))]
 # # Same tribe corr (e.g Chironomini)= 0.8870648
 # spp_vcv_ou[grep("Chironomus|Polypedilum", row.names(spp_vcv_ou)), grep("Chironomus|Polypedilum", colnames(spp_vcv_ou))]
 # # Same subfamily (e.g. Chiornominae) corr = 0.8157158

@@ -5,7 +5,7 @@ format: docx
 editor: source
 bibliography: references.bib
 editor_options: 
-  chunk_output_type: console
+  chunk_output_type: inline
 ---
 
 ```{r}
@@ -19,56 +19,25 @@ source("cmdstanr_functions.R")
 
 ```
 
-
-"ifqcdtblrs_fi_qf_qi_constr_z" trialled constraining the latent ordination by selecting two species with divergent responses to the unconstrained ordination in "ifqcdtblrs_fi_qf_qi_spp_vcv_ou".  The resulting model suffered from split chains and very low Effective Sample Size for tjur_r2 of the selected anchor species.  This indicates that the constrained approach is not applicable to this high-dimension dataset.  We thus implemented an unconstrained, non-centered latent factor ordination, which requires post-processing [@assman_etal_2014].
-
-```{r}
-#| eval: false
-
-pred_site <- c("I","F","Q","Q2","C","D","T","B","L","F_I","Q_F","Q_I")
-pred_obs <- c("riff","season") # included in all candidate models
-
- # "ifqcdtblrs_fi_qf_qi_constr_z" # Note taxa re-ordered to facilitate constrained z
-run_200spp_model(pred_site = pred_site,
-                 mod_code = "ifqcdtblrs_fi_qf_qi_constr_z")
-# This did not work well.
-
-```
-
-The following therefore first repeats the code used to run the optimal model using the OU model for phylogenetic covariance, followed by post-processing in R to align the z_lambda drifting latent ordinations. 
+The run_200spp_model() function (loaded in "quick_200_spp_data_assembly_for_latent_tests.R") runs the specified 200-species model and creates a list of objects for post-processing ("species_set", "sample_set", "pred_set", "data",       "fit", "diagnostics", "summary").  This should take ~ 1.5 h.
 
 ```{r}
 #| eval: false
 
-#### standardized phylogenetic matrix phylo_cor
-spp_class_all <- readRDS(
-  url("https://tools.thewerg.unimelb.edu.au/mwbugs/data/spp_classes_itis.rds"))
-spp_trial_1 <- spp_trial_1[match(colnames(biota_1_ct),spp_trial_1$taxoncode),]
-spp_class_200 <- spp_class_all[spp_trial_1$taxon]
-# Select the subset of taxa relevant for the current analysis (or use all 982 spp)
-spp_tree_1 <- taxize::class2tree(spp_class_200)
-# Scale the tree so total root-to-tip height is exactly 1.0
-spp_tree_1_raw <- spp_tree_1$phylo
-max_height <- max(ape::node.depth.edgelength(spp_tree_1_raw))
-scaled_tree <- spp_tree_1_raw
-scaled_tree$edge.length <- scaled_tree$edge.length / max_height
-spp_vcv_ou <- ape::vcv(scaled_tree)
-
-master_data$phylo_cor <- spp_vcv_ou
-params_to_summarise[params_to_summarise == "rho_phylo"] <- "alpha_phylo"
 run_200spp_model(pred_site = pred_site,
                  mod_code = "ifqcdtblrs_fi_qf_qi_ou",
-                 mod_path = "stancode/jointspp_pa_no_eps_ou.stan")
+                 mod_path = "stancode/jointspp_pa_no_eps_ou.stan", 
+                 cal_loo = TRUE)
 
 ```
 
-The need for post-processing is illustrated in @fig-alignment, showing the raw traceplots of the four chains for latent axes 1 and 2 for site 1 (A. z_expanded[1,1], B. z_expanded[1,2]) from the Stan model. They show that the score estimates for each chain drifting over the 1200 iterations.  This is because the model does not constrain the ordination to a set rotation (and attempting to do so resulted in very low effective sample sizes).  The following code chunk applies a Procrustes rotation to the ordination in each iteration, which results in well-mixed, stable traceplots for the aligned z-values (C and D).
+The need for post-processing is illustrated in @fig-alignment, showing the raw traceplots of the four chains for latent axes 1 and 2 for site 1 (A. z_expanded[1,1], B. z_expanded[1,2]) from the Stan model. They show that the score estimates for each chain drifting independently over the 1200 iterations.  This is because the model does not constrain the ordination to a set rotation (and attempting to do so produced stable, but split chains that did not converge).  The following code chunk applies a Procrustes rotation to the ordination in each iteration, which results in well-mixed, stable traceplots for the aligned z-values (C and D).
 
 ```{r}
 #| label: fig-alignment
 #| echo: false
-#| fig-width = 5
-#| fig-height = 5
+#| fig-width: 5
+#| fig-height: 5
 #| fig-cap = "Traceplots of raw estimates of example latent factor score for site 1 (A. axis 1, B. axis 2) for 1200 iterations in the 200-species model.  C and D show the same estimates after Procrustes rotation."
 
 load("~/uomShare/wergStaff/ChrisW/git-data/mw_metabarcoding_model/examp_draws.rda")
@@ -201,13 +170,8 @@ From these aligned z and lambda draws, we revised the diagnostic summary for the
 lambda_diagnostic_summary <- summarise_draws(lambda_aligned_draws)
 z_diagnostic_summary <- summarise_draws(all_sites_aligned_draws)
 
-mod_bundle$diagnostics$num_divergent; 
-mod_bundle$diagnostics$num_max_treedepth
-mod_bundle$diagnostics$ebfmi
 mod_summary <- mod_bundle$summary[-grep("z_exp|lambda",mod_bundle$summary$variable),]
 mod_summary <- rbind(mod_summary, lambda_diagnostic_summary,z_diagnostic_summary)
-min(mod_summary$ess_bulk, na.rm = TRUE)
-min(mod_summary$ess_tail, na.rm = TRUE)
 mod_summary$variable[which(mod_summary$ess_bulk == min(mod_summary$ess_bulk, na.rm = TRUE))]
 diag_summary <- data.frame(spec = c("No. sampling iterations","No. divergences",
                                     "No. max_treedepth exceedences",
@@ -229,61 +193,169 @@ ft_to_word(flextable::flextable(diag_summary))
 
 
 ```{r}
-# --- 3. EXTRACT POSTERIOR MEANS DROPPING THE SKIPPED SECTIONS ---
-# The margin '3' calculates the mean across the 275 observations, 
-# seamlessly aggregating across all 1200 iterations and all 4 chains.
+#| label: fig-latent_factor_ordination
+#| echo: false
+#| fig-width: 5
+#| fig-height: 5
+#| fig-cap = "Ordination of latent factors explaining random variation among sites (grey points), overlain by mean locations of species in the ordination space (red points)."
+
+# Plot latent site ordination
 mean_obs_z1 <- apply(z_unpacked_aligned[, , , 1], 3, mean, na.rm = TRUE)
 mean_obs_z2 <- apply(z_unpacked_aligned[, , , 2], 3, mean, na.rm = TRUE)
-
-# --- 4. MAP TO COLLAPSED SITE-LEVEL DATA FRAME ---
-# Bind the observation-level averages back to your original site indices
-ordination_df <- data.frame(
-  Site = mod_data$site, # Replace with your exact site integer array
+ordination_df <- data.frame(Site = mod_data$site, 
   Z1   = mean_obs_z1,
   Z2   = mean_obs_z2
 )
-
-# Collapse repeat visits down to get exactly 223 rows (one per unique site)
+# Site scores are unique, so reduce to one value per site
 unique_site_ordination <- unique(ordination_df)
-
-# --- 5. GENERATE THE FINAL CLEAN SCATTER PLOT ---
-plot(unique_site_ordination$Z1, unique_site_ordination$Z2, 
-     pch = 21, bg = grey(0.8), 
-     xlab = "Latent Axis 1 (Residual Site Gradients)", 
-     ylab = "Latent Axis 2 (Residual Site Gradients)", 
-     main = "Aligned Multi-Chain Site Ordination")
+plot(unique_site_ordination$Z1, unique_site_ordination$Z2,  pch = 21, bg = grey(0.8), 
+     xlab = "Latent Axis 1", 
+     ylab = "Latent Axis 2", asp = 1)
 abline(v = 0, h = 0, lty = 2)
 
-####
+samples <- mod_bundle$sample_set
+sites <- unique(samples[c("reach_v12","site_no")])
 
-# 1. Build a real-world geographic distance matrix between your 223 sites
-coords <- sf::st_coordinates(sites)
-dist_matrix <- as.matrix(dist(coords))
-
-# 2. Invert the distance matrix to create a spatial weights matrix (closer = heavier weight)
-weights_matrix <- 1 / dist_matrix
-diag(weights_matrix) <- 0 
-weights_matrix[is.infinite(weights_matrix)] <- 0
-
-# 3. Run Moran's I on Latent Axis 1 and Axis 2
-moran_z1 <- ape::Moran.I(unique_site_ordination$Z1, weights_matrix)
-moran_z2 <- ape::Moran.I(unique_site_ordination$Z2, weights_matrix)
-
-# Inspect the results
-print(moran_z1$p.value)
-print(moran_z2$p.value)
-# Both >0.5, which strongly suggests randomness without spatial clumping.
-
-# Run a regression predicting Axis 1 from geography
-Z <- cbind(unique_site_ordination, coords)
-spatial_lm1 <- lm(Z1 ~ X * Y, data = Z)
-spatial_lm2 <- lm(Z2 ~ X * Y, data = Z)
-
-# Look at the Multiple R-squared values
-summary(spatial_lm1)$r.squared  # 0.01
-summary(spatial_lm2)$r.squared  # 0.01
+# Map species to the ordination - put z and lambda on the same scale first
+species <- mod_bundle$species_set
+mean_lambda1 <- apply(lambda_unpacked_aligned[, , , 1], 3, mean, na.rm = TRUE)
+mean_lambda2 <- apply(lambda_unpacked_aligned[, , , 2], 3, mean, na.rm = TRUE)
+max_site_range <- max(abs(c(unique_site_ordination$Z1, unique_site_ordination$Z2)))
+max_spp_range  <- max(abs(c(mean_lambda1, mean_lambda2)))
+# The scale factor adjusts species to occupy roughly 80% of the site space
+scale_factor <- (max_site_range / max_spp_range) * 0.8
+species_ord <- data.frame(species = species$taxon[match(colnames(mod_bundle$data$y),species$taxoncode)],
+                          taxoncode = colnames(mod_bundle$data$y),
+                          axis_1  = mean_lambda1 * scale_factor, 
+                          axis_2  = mean_lambda2 * scale_factor)
+points(species_ord$axis_1,species_ord$axis_2, pch = 16, cex = 0.5, col = "red")
 
 ```
 
 
+```{r}
+
+# # 5 sites with latent axis 1 scores > 2.5
+# # used to manually check them first
+# identify(unique_site_ordination$Z1, unique_site_ordination$Z2, unique_site_ordination$Site)
+high_z2s <- unique_site_ordination[unique_site_ordination$Z2 > 2,]
+sites[sites$site_no %in% high_z2s$Site,]
+low_z1s <-  unique_site_ordination[unique_site_ordination$Z1 < -2.1,]
+sites[sites$site_no %in% low_z1s$Site,]
+# "BNY_24764" "GIS_1106"  "LOL_11925" "PRW_13767" "REI_3934" 
+# A selection of sites that don't at first blush have anything in common
+# Species associated with those sites
+species_ord[species_ord$axis_1 < -2.1,] # all classic disturbance tolerant species
+species_ord[species_ord$axis_2 > 2,] # A mix of moderately tolerant and sensitive species
+# Perhaps the environmental predictors of these sites suggest they should be good
+# but they support some species typical of degraded sites...
+
+# Conduct broader tests for any residual geographical information
+coords <- sf::st_coordinates(sites)
+dist_matrix <- as.matrix(dist(coords))
+# Invert the distance matrix to create a spatial weights matrix (closer = heavier weight)
+weights_matrix <- 1 / dist_matrix
+diag(weights_matrix) <- 0 
+weights_matrix[is.infinite(weights_matrix)] <- 0
+# Moran's I to assess for any potential contagious distribution
+moran_z1 <- ape::Moran.I(unique_site_ordination$Z1, weights_matrix)
+moran_z2 <- ape::Moran.I(unique_site_ordination$Z2, weights_matrix)
+# Both >0.5, which suggests randomness without spatial clumping.
+
+# Regressions predicting Axis 1 and 2 from spatial locatoin
+Z <- cbind(unique_site_ordination, coords)
+spatial_lm1 <- lm(Z1 ~ X * Y, data = Z)
+spatial_lm2 <- lm(Z2 ~ X * Y, data = Z)
+summary(spatial_lm1)$r.squared  
+summary(spatial_lm2)$r.squared  
+# Both ~ 0.01, which suggests no residual trend across Euclidean space
+
+```
+
+AUC code
+
+```{r}
+
+library(PRROC)
+library(posterior)
+
+# 1. Extract the posterior mean probabilities across all iterations and chains
+# This natively returns a clean [n_obs x n_taxa] matrix in R
+mean_p_total <- mod_fit$draws("p_total_out")
+ mean_p_total <- matrix(mean_p_total, nrow = n_obs, ncol = n_taxa)
+
+mean_p_env   <- summary(mod_fit$draws("p_env_out"))$mean
+mean_p_env   <- matrix(mean_p_env, nrow = n_obs, ncol = n_taxa)
+
+# 2. Set up arrays to hold the final AUC metrics for your 200 (or 875) species
+roc_auc_total <- numeric(n_taxa)
+pr_auc_total  <- numeric(n_taxa)
+roc_auc_env   <- numeric(n_taxa)
+pr_auc_env    <- numeric(n_taxa)
+
+# 3. Calculate curves species-by-species
+for(j in 1:n_taxa) {
+  # Actual real-world 0/1 observations for species j
+  actual_y <- mod_data$y[, j] 
+  
+  # Separate probabilities for presences vs absences
+  pred_pres_total <- mean_p_total[actual_y == 1, j]
+  pred_abs_total  <- mean_p_total[actual_y == 0, j]
+  
+  pred_pres_env   <- mean_p_env[actual_y == 1, j]
+  pred_abs_env    <- mean_p_env[actual_y == 0, j]
+  
+  # Compute the full-model curves (Environment + Latent factors)
+  fg_t <- pred_pres_total; bg_t <- pred_abs_total
+  roc_auc_total[j] <- PRROC::roc.curve(scores.class0 = fg_t, scores.class1 = bg_t)$auc
+  pr_auc_total[j]  <- PRROC::pr.curve(scores.class0 = fg_t, scores.class1 = bg_t)$auc
+  
+  # Compute the pure environmental curves (U matrix only)
+  fg_e <- pred_pres_env; bg_e <- pred_abs_env
+  roc_auc_env[j] <- PRROC::roc.curve(scores.class0 = fg_e, scores.class1 = bg_e)$auc
+  pr_auc_env[j]  <- PRROC::pr.curve(scores.class0 = fg_e, scores.class1 = bg_e)$auc
+}
+
+# Combine into a gorgeous evaluation summary dataframe!
+species_metrics <- data.frame(
+  species = species_set$taxon[match(colnames(mod_data$y), species_set$taxoncode)],
+  taxoncode = colnames(mod_data$y),
+  roc_auc_total = roc_auc_total,  pr_auc_total = pr_auc_total,
+  roc_auc_env = roc_auc_env,  pr_auc_env = pr_auc_env)
+
+library(dplyr)
+
+# 1. Calculate the real-world prevalence for each of your 875 species
+# colSums(y) gives presences, nrow(y) is 275 total observations
+species_prevalence <- colSums(trial_1_data$y) / nrow(trial_1_data$y)
+
+# 2. Attach the prevalence data to your existing AUC summary dataframe
+# (Assumes 'species_metrics' is the dataframe generated by our PRROC loop)
+species_metrics <- species_metrics %>%
+  mutate(
+    Prevalence = species_prevalence,
+    # Classify each species into its explicit ecological tier
+    Tier = case_by(
+      Prevalence >= 0.20 ~ "Common (>20%)",
+      Prevalence >= 0.05 & Prevalence < 0.20 ~ "Infrequent (5-20%)",
+      Prevalence < 0.05  ~ "Truly Rare (<5%)"
+    )
+  )
+
+# 3. Generate the publication-ready grouped evaluation summary table!
+model_evaluation_table <- species_metrics %>%
+  group_by(Tier) %>%
+  summarise(
+    Species_Count = n(),
+    Mean_Prevalence = mean(Prevalence),
+    # Full Model Metrics (Environment + Latent Space)
+    Mean_ROC_Total  = mean(ROC_AUC_Total),
+    Mean_PR_Total   = mean(PR_AUC_Total),
+    # Pure Environmental Metrics (U Matrix Only)
+    Mean_ROC_Env    = mean(ROC_AUC_Env),
+    Mean_PR_Env     = mean(PR_AUC_Env)
+  )
+
+print(model_evaluation_table)
+```
 

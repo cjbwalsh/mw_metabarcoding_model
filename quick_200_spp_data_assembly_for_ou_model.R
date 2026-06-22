@@ -85,19 +85,10 @@ biota_1 <- biota_all[biota_all$taxoncode %in% spp_trial_1$taxoncode,]  #11194 re
 ### Biota presence/absence matrix
 biota_1_ct <- with(biota_1, ct(smpcode, shortcode, count))
 
-# Two species orthogonally placed on the unconstrained latent ordination
-well_behaved_sp_pr <- c("QDAH0602","QH5601AC")  # Paratanytarsus grimmii (prev 0.33) %& Microvelia sp. B-ADS1854 65  (prev 0.29)
-# Two species shown to be predicted well in the first trial to aid the latent-factor ordination
-# c("QT250713", "IH010101")
-
-# Put well-behaved taxa first for constrained latent ordination
-taxa_reorder <- c(match(c("QT250713", "IH010101"),colnames(biota_1_ct)), which(!colnames(biota_1_ct) %in% c("QT250713", "IH010101")))
-biota_1_ct <- biota_1_ct[, taxa_reorder]
-
 #### standardized phylogenetic matrix phylo_cor
-
-spp_class_all <- readRDS(
-  url("https://tools.thewerg.unimelb.edu.au/mwbugs/data/spp_classes_itis.rds"))
+pp_class_all <- readRDS("~/uomShare/wergStaff/ChrisW/git-data/mw_metabarcoding_model/spp_class_all_inf.rds")
+#   url("https://tools.thewerg.unimelb.edu.au/mwbugs/data/spp_classes_itis.rds"))
+# the non-https version removes subgenus, subtribe and section, which are non-informative
 spp_trial_1 <- spp_trial_1[match(colnames(biota_1_ct),spp_trial_1$taxoncode),]
 spp_class_200 <- spp_class_all[spp_trial_1$taxon]
 # Select the subset of taxa relevant for the current analysis (or use all 982 spp)
@@ -178,7 +169,7 @@ sites$meanq <- cat_env$meanq_mm[match(sites$reach_v12,cat_env$reach)]
 sites$meant <- subc_env$meant_y30_2022[match(sites$reach_v12,subc_env$reach)] 
 # Elevation above sea-level (m). See Walsh (2023) Chapter 5.9
 sites$elev <- subc_env$elev_asl_m[match(sites$reach_v12,subc_env$reach)]
-# A lowland/estuarine influence indicator
+# A lowland/estuarine influenc indicator
 sites$lowness <- -1
 sites$lowness[sites$elev < 30] <- -0.5
 sites$lowness[sites$elev < 15] <- 0
@@ -281,7 +272,9 @@ master_data <- list(n_obs = nrow(biota_1_ct),          # no. samples
                     y = as.matrix(biota_1_ct),
                     site  = site,
                     M_site_res = M_site_res,
-                    phylo_cor = spp_vcv_ou)
+                    phylo_cor = spp_vcv_ou)            
+
+# This omits phylo_cor, to be added in MW_metabarcoding_200_spp_vcv_opt.qmd
 
 params_to_summarise <- c(
   "mu_beta_site", "scale_beta_site", "beta_site",  # Fixed site-level effects
@@ -297,7 +290,10 @@ params_to_summarise <- c(
 pred_site <- c("I","F","Q","Q2","C","D","T","B","L","F_I","Q_F","Q_I")
 pred_obs <- c("riff","season") # included in all candidate models
 
-run_200spp_model <- function(pred_site, mod_code, mod_path = "stancode/jointspp_pa_ou_constrained_z.stan"){
+run_200spp_model <- function(pred_site, mod_code, 
+                             mod_path = "stancode/jointspp_pa_no_eps.stan",
+                             calc_loo = TRUE  # can exceed 64 G RAM in big models
+                             ){
 pred_set <- u_site[,match(pred_site, colnames(u_site))]
 mod_data <- master_data
 mod_data$n_site_pred <- length(pred_site)
@@ -330,7 +326,7 @@ log_lik_matrix <- model_fit$draws(variables = "log_lik", format = "draws_matrix"
 n_chains <- posterior::nchains(log_lik_matrix)
 n_draws <- posterior::ndraws(log_lik_matrix)
 r_eff <- posterior::ess_bulk(log_lik_matrix) / (n_draws / n_chains)
-mod_loo <- loo::loo(log_lik_matrix, r_eff = r_eff, cores = 2) # 4 cores sails too close to the wind o 64 Gb RAM machine
+mod_loo <- loo::loo(log_lik_matrix, r_eff = r_eff, cores = 1) # 4 cores sails too close to the wind o 64 Gb RAM machine
 mod_bundle$loo <- mod_loo
 saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
 rm(mod_bundle,mod_summary, model_fit, mod_loo, log_lik_matrix, r_eff); gc()
