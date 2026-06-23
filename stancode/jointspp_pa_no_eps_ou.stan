@@ -100,7 +100,7 @@ model {
   // Priors for taxon intercepts
   mu_taxon ~ normal(0, 3);                
   a_taxon_raw ~ std_normal();             
-  sigma_taxon ~ normal(1, 0.1);  # tight around mean 1 to...Tom justification?
+  sigma_taxon ~ normal(1, 0.1);  // tight around mean 1 to...Tom justification?
   
   // Priors for latent factors
   to_vector(z_raw) ~ std_normal();      

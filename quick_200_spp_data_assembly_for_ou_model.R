@@ -86,7 +86,7 @@ biota_1 <- biota_all[biota_all$taxoncode %in% spp_trial_1$taxoncode,]  #11194 re
 biota_1_ct <- with(biota_1, ct(smpcode, shortcode, count))
 
 #### standardized phylogenetic matrix phylo_cor
-pp_class_all <- readRDS("~/uomShare/wergStaff/ChrisW/git-data/mw_metabarcoding_model/spp_class_all_inf.rds")
+spp_class_all <- readRDS("~/uomShare/wergStaff/ChrisW/git-data/mw_metabarcoding_model/spp_class_all_inf.rds")
 #   url("https://tools.thewerg.unimelb.edu.au/mwbugs/data/spp_classes_itis.rds"))
 # the non-https version removes subgenus, subtribe and section, which are non-informative
 spp_trial_1 <- spp_trial_1[match(colnames(biota_1_ct),spp_trial_1$taxoncode),]
