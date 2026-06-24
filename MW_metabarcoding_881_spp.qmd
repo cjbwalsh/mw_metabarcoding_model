@@ -18,9 +18,11 @@ source("cmdstanr_functions.R")
 
 
 ```{r}
+#| eval: false
 
 run_881spp_model(pred_site = pred_site,
                  mod_code = "ifqcdtblrs_fi_qf_qi",
                  mod_path = "stancode/jointspp_pa_no_eps_ou.stan")
-
+# model sampling ran easily on <10 Gb; compiling summary table reached ~45 Gb, 
+# loo calculation exceeded the available 64Gb RAM, and wasn't completed.
 ```

@@ -1,5 +1,5 @@
 ---
-title: "Latent ordination in the 200-species model"
+title: "Selection of optimal predictor set using 200-species model"
 author: "Christopher J Walsh"
 format: docx
 editor: source
@@ -12,7 +12,7 @@ editor_options:
 #| label: setup
 #| echo: false
 
-source("quick_200_spp_data_assembly_for_ou_model.R")
+source("quick_196_spp_data_assembly_for_ou_model.R")
 # This creates data ready for the model for constrained_z
 source("cmdstanr_functions.R")
 # post processing functions
@@ -24,29 +24,39 @@ The run_200spp_model() function (loaded in "quick_200_spp_data_assembly_for_late
 ```{r}
 #| eval: false
 
-run_200spp_model(pred_site = pred_site,
+run_196spp_model(pred_site = pred_site,
                  mod_code = "ifqcdtblrs_fi_qf_qi_ou",
                  mod_path = "stancode/jointspp_pa_no_eps_ou.stan", 
-                 calc_loo = TRUE)
+                 calc_loo = TRUE)  
+# The full model was used first to validate that all was in order
 
 ```
 
 The need for post-processing is illustrated in @fig-alignment, showing the raw traceplots of the four chains for latent axes 1 and 2 for site 1 (A. z_expanded[1,1], B. z_expanded[1,2]) from the Stan model. They show that the score estimates for each chain drifting independently over the 1200 iterations.  This is because the model does not constrain the ordination to a set rotation (and attempting to do so produced stable, but split chains that did not converge).  The following code chunk applies a Procrustes rotation to the ordination in each iteration, which results in well-mixed, stable traceplots for the aligned z-values (C and D).
 
 ```{r}
-#| label: fig-alignment
-#| echo: false
-#| fig-width: 5
-#| fig-height: 5
-#| fig-cap: "Traceplots of raw estimates of example latent factor score for site 1 (A. axis 1, B. axis 2) for 1200 iterations in the 200-species model.  C and D show the same estimates after Procrustes rotation."
+#| label: u_sets
 
-load("~/uomShare/wergStaff/ChrisW/git-data/mw_metabarcoding_model/examp_draws.rda")
-par(mfrow = c(2,2), mar = c(4,4,1,1))
-base_traceplot(examp_draws$z11_unaligned, "z_expanded[1,1]"); title(main = "A.", adj = 0)
-base_traceplot(examp_draws$z12_unaligned, "z_expanded[1,2]"); title(main = "B.", adj = 0)
-base_traceplot(examp_draws$z1_aligned[,,1, drop = FALSE], "z_aligned[1,1]"); title(main = "C.", adj = 0)
-base_traceplot(examp_draws$z1_aligned[,,2, drop = FALSE], "z_aligned[1,2]"); title(main = "D.", adj = 0)
+# Core predictors
+u_core <- c("I","F","Q","Q2","C","T")   # and "riff","season" in u_obs, which will remain unchanged
+u_opts <- c("D","B","L")
+u_int_opts <- c("F_I","Q_F","Q_I")  # and maybe (if B or D are important, Q_D and B_I)
 
+# so pred combinations to trial are:
+pred_set <- list(u_core, c(u_core, "D"), c(u_core, "B"), c(u_core, "L"), 
+                  c(u_core, "D","B"), c(u_core, "D","L"), c(u_core, "B","L"), 
+                  c(u_core, "D","B","L"))
+
+names(pred_set) <- c("ifqct", "ifqctd", "ifqctb", "ifqctl", 
+                     "ifqctdb", "ifqctdl", "ifqctbl", "ifqctdbl")
+
+for(i in 1:length(pred_set)){
+run_196spp_model(pred_site = pred_set[[i]],
+                 mod_code = names(pred_set)[i],
+                 mod_path = "stancode/jointspp_pa_no_eps_ou.stan", 
+                 calc_summary = FALSE, calc_loo = TRUE)  
+  gc()
+}
 ```
 
 The following code aligns the latent factor parameters z_expanded and lambda.

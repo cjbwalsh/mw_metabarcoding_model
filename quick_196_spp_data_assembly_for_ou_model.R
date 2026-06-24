@@ -30,6 +30,8 @@ samples <- DBI::dbGetQuery(mwbugs,
                            WHERE sample_project_groups.project_code = 3;")
 samples$sitecode[grep("TOO",samples$sitecode)] <- "TOO-4334-2"
 samples$sitecode_v12[grep("TOO",samples$sitecode_v12)] <- "TOO_4332c"
+# Remove problem UYT sample (incorrect source data)
+samples <- samples[samples$smpcode != "384-UYT-199-4-DP",]
 sites <- sf::st_read(mwbugs, query = 
                        paste0("SELECT * FROM sites WHERE sitecode_v12 IN ('",
                               paste(samples$sitecode_v12, collapse = "','"),"');"))
@@ -45,6 +47,7 @@ biota_all <- DBI::dbGetQuery(mwbugs,
                            WHERE sample_project_groups.project_code = 3;")
 biota_all <- biota_all[!grepl("EXCLUDE this record from 3-rep", 
                               biota_all$notes),]  #20584
+biota_all <- biota_all[biota_all$smpcode %in% samples$smpcode,]
 species <- unique(biota_all[c("taxoncode","taxon")])
 
 ####
@@ -56,31 +59,30 @@ biot_prev <- aggregate(biot_by_site$taxoncode,
                        by = list(taxoncode = biot_by_site$taxoncode, taxon = biot_by_site$taxon), 
                        FUN = length)
 biot_prev$prevalence <- biot_prev$x/length(unique(samples$reach_v12))
-biot_prevalent <- biot_prev[biot_prev$prevalence >= 0.2 & biot_prev$prevalence <= 0.8,]  # 111 species
-biot_non_prevalent <- biot_prev[!biot_prev$taxoncode %in% biot_prevalent$taxoncode,] #777 species
+biot_prevalent <- biot_prev[biot_prev$prevalence >= 0.2 & biot_prev$prevalence <= 0.8,]  # 109 species
+biot_non_prevalent <- biot_prev[!biot_prev$taxoncode %in% biot_prevalent$taxoncode,] #772 species
 # about 1 quarter of that might be a good number to start with
 # But first quarantine a few congenerics to make the phylogenetic similarity diverse
 spp_trial <- biot_prevalent[grepl("QT2505",biot_prevalent$taxoncode) | 
                               grepl("QT2511",biot_prevalent$taxoncode) |
                               grepl("QE0609",biot_prevalent$taxoncode),]
-spp_trial_1 <- biot_prevalent
-biot_prevalent <- biot_prevalent[!biot_prevalent$taxoncode %in% spp_trial$taxoncode,] # down to 104
-spp_trial <- rbind(spp_trial, biot_prevalent[seq(4,104,4),])  
+spp_trial_1 <- biot_prevalent  #113 species
+biot_prevalent <- biot_prevalent[!biot_prevalent$taxoncode %in% spp_trial$taxoncode,] # down to 102
+spp_trial <- rbind(spp_trial, biot_prevalent[seq(4,10,4),])  
 # subset of 33 for first preliminary trial. I want to make sure that spp_trial is a subset of the larger spp_trial_1
 # sum(!spp_trial$taxoncode %in% spp_trial_1$taxoncode) # 0 # all good
 # A secondary subset for model selection without epsilon parameter: all prevalent species + 
 # Add less (or more) prevalent species, with increased chance of congenerics by selecting the adjacent species
 for(i in 1:nrow(biot_prevalent)){
   spp_trial_1 <- unique(rbind(spp_trial_1, biot_prev[which(biot_prev$taxon == biot_prevalent$taxon[i]) + 1,]))
-} # 197  = ~ 20% of the full set
+} # 193  = ~ 20% of the full set
 # I also want to include some lowland species to give the "L" predictor a fair go
 lowland_spp <- c("OP0599A1",  # 1 record - Cannings St ford
                  "IB020101","KG021202") # both with lots of lowland records
 # sum(lowland_spp %in%spp_trial_1$taxoncode )  # None included so far, so add them
-spp_trial_1 <- unique(rbind(spp_trial_1, biot_prev[biot_prev$taxoncode %in% lowland_spp,]))  #200 spp
+spp_trial_1 <- unique(rbind(spp_trial_1, biot_prev[biot_prev$taxoncode %in% lowland_spp,]))  #196 spp
 
-biota <- biota_all[biota_all$taxoncode %in% spp_trial$taxoncode,]  #down to 2780 records for the first 33 spp trial
-biota_1 <- biota_all[biota_all$taxoncode %in% spp_trial_1$taxoncode,]  #11194 records
+biota_1 <- biota_all[biota_all$taxoncode %in% spp_trial_1$taxoncode,]  #10989 records
 
 ### Biota presence/absence matrix
 biota_1_ct <- with(biota_1, ct(smpcode, shortcode, count))
@@ -90,9 +92,9 @@ spp_class_all <- readRDS("~/uomShare/wergStaff/ChrisW/git-data/mw_metabarcoding_
 #   url("https://tools.thewerg.unimelb.edu.au/mwbugs/data/spp_classes_itis.rds"))
 # the non-https version removes subgenus, subtribe and section, which are non-informative
 spp_trial_1 <- spp_trial_1[match(colnames(biota_1_ct),spp_trial_1$taxoncode),]
-spp_class_200 <- spp_class_all[spp_trial_1$taxon]
+spp_class_196 <- spp_class_all[spp_trial_1$taxon]
 # Select the subset of taxa relevant for the current analysis (or use all 982 spp)
-spp_tree_1 <- taxize::class2tree(spp_class_200)
+spp_tree_1 <- taxize::class2tree(spp_class_196)
 # Scale the tree so total root-to-tip height is exactly 1.0
 spp_tree_1_raw <- spp_tree_1$phylo
 max_height <- max(ape::node.depth.edgelength(spp_tree_1_raw))
@@ -274,8 +276,6 @@ master_data <- list(n_obs = nrow(biota_1_ct),          # no. samples
                     M_site_res = M_site_res,
                     phylo_cor = spp_vcv_ou)            
 
-# This omits phylo_cor, to be added in MW_metabarcoding_200_spp_vcv_opt.qmd
-
 params_to_summarise <- c(
   "mu_beta_site", "scale_beta_site", "beta_site",  # Fixed site-level effects
   "mu_beta_obs", "scale_beta_obs", "beta_obs",  # Fixed sample-level effects
@@ -290,9 +290,10 @@ params_to_summarise <- c(
 pred_site <- c("I","F","Q","Q2","C","D","T","B","L","F_I","Q_F","Q_I")
 pred_obs <- c("riff","season") # included in all candidate models
 
-run_200spp_model <- function(pred_site, mod_code, 
+run_196spp_model <- function(pred_site, mod_code, 
                              mod_path = "stancode/jointspp_pa_no_eps.stan",
-                             calc_loo = TRUE  # can exceed 64 G RAM in big models
+                             calc_loo = TRUE,  # can exceed 64 G RAM in big models
+                             calc_summary = TRUE # slows down the post-processing step
                              ){
 pred_set <- u_site[,match(pred_site, colnames(u_site))]
 mod_data <- master_data
@@ -304,7 +305,7 @@ mod <- cmdstan_model(stan_file = mod_path,
                      compile_model_methods = TRUE) #, 
 #  force_recompile = TRUE )
 mod_dir <-paste0("~/uomShare/wergStaff/ChrisW/git-data/",
-                 "mw_metabarcoding_model/trial_200spp_models/", mod_code)
+                 "mw_metabarcoding_model/trial_196spp_models/", mod_code)
 if (!dir.exists(mod_dir)) dir.create(mod_dir)
 model_fit <- mod$sample(data = mod_data, seed = proj_seed,
                         output_dir = mod_dir,
@@ -315,19 +316,24 @@ model_fit <- mod$sample(data = mod_data, seed = proj_seed,
 mod_bundle$fit <- model_fit
 mod_bundle$diagnostics <- model_fit$diagnostic_summary()
 saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
+if(calc_summary){
 mod_summary <- model_fit$summary(variables = params_to_summarise); gc()
 mod_bundle$summary <- mod_summary
 saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
-# The following is approach is taken instead of using cmdstanr's wrapper fit$loo()
-# to avoid spikes in RAM usage.
-# (ess_bulk is used because elpd is an expected mean. bulk ess is a measure of 
-# sampling efficiency of central tendenciees)
-log_lik_matrix <- model_fit$draws(variables = "log_lik", format = "draws_matrix")
+}
+if(calc_loo){
+  # The following is approach is taken instead of using cmdstanr's wrapper fit$loo()
+  # to avoid spikes in RAM usage.
+  # (ess_bulk is used because elpd is an expected mean. bulk ess is a measure of 
+  # sampling efficiency of central tendenciees)
+  # calculate LOO only using environmental predictors
+log_lik_matrix <- model_fit$draws(variables = "log_lik_env", format = "draws_matrix")
 n_chains <- posterior::nchains(log_lik_matrix)
 n_draws <- posterior::ndraws(log_lik_matrix)
 r_eff <- posterior::ess_bulk(log_lik_matrix) / (n_draws / n_chains)
 mod_loo <- loo::loo(log_lik_matrix, r_eff = r_eff, cores = 1) # 4 cores sails too close to the wind o 64 Gb RAM machine
 mod_bundle$loo <- mod_loo
 saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
+}
 rm(mod_bundle,mod_summary, model_fit, mod_loo, log_lik_matrix, r_eff); gc()
 }
