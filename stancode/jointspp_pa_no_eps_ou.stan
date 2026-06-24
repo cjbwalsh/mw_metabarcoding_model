@@ -133,6 +133,7 @@ model {
 generated quantities {
   array[n_obs, n_taxa] int<lower=0, upper=1> y_rep; // Simulated replica data
   vector[n_obs * n_taxa] log_lik;                   // Flattened log-likelihood
+  vector[n_obs * n_taxa] log_lik_env;               // Likelihood given only fixed predictors
   vector[n_taxa] tjurs_r2_total;                    // Explanatory strength of the full model
   vector[n_taxa] tjurs_r2_env;                      // Explanatory strength using only fixed predictors 
   matrix[n_obs, n_taxa] p_total_out;                // For calculation of full-model AUC in R
@@ -169,6 +170,7 @@ generated quantities {
         
         y_rep[i, j] = bernoulli_rng(p_total); 
         log_lik[idx] = bernoulli_logit_lpmf(y[i, j] | mu[i, j]);
+        log_lik_env[idx] = bernoulli_logit_lpmf(y[i, j] | mu_env[i, j]);
         idx += 1;
         
         if (y[i, j] == 1) {
