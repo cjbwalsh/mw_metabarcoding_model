@@ -1,0 +1,504 @@
+---
+title: "Full model run"
+format: docx
+editor: source
+editor_options: 
+  chunk_output_type: inline
+---
+
+
+```{r}
+#| label: setup
+#| echo: false
+
+source("quick_881_spp_data_assembly.R")
+# This creates data ready for the model for constrained_z
+source("cmdstanr_functions.R")
+# post processing functions
+
+```
+
+
+```{r}
+#| eval: false
+
+mod_code <- "mod_881spp_500"
+mod_dir <- "~/uomShare/wergStaff/ChrisW/git-data/mw_metabarcoding_model/full_881spp_models/"
+# system.time({
+# run_881spp_model(pred_site = pred_site <- c("I","F","Q","Q2","C","T","L","F_I","Q_F","Q_I","F_I_Q"),
+#                  mod_code = mod_code,
+#                  mod_path = "stancode/jointspp_pa_no_eps_ou.stan")  
+# # Doesn't compile summary or loo, which requires a big-memory computer
+# }) # 16.6 h  on 64 Gb server
+# # Compile summary and loo on big-memory server
+
+mod_bundle <- readRDS(paste0(mod_dir, "/", mod_code,"/", mod_code, "model_bundle.rds"))
+mod_fit <- mod_bundle$fit
+mod_summary <- mod_fit$summary(variables = params_to_summarise); gc()
+mod_bundle$summary <- mod_summary
+saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code,"/", mod_code, "model_bundle.rds"))
+
+```
+
+The following code aligns the latent factor parameters z_expanded and lambda. (requires >75 Gb RAM)
+
+```{r}
+
+mod_data <- mod_bundle$data
+
+# Ensure your dimensions are correctly defined for your active model
+n_obs <- mod_data$n_obs
+n_site <- mod_data$n_site
+n_taxa <- mod_data$n_taxa
+n_latent <- mod_data$n_latent
+n_chains <- mod_fit$num_chains()
+n_iterations <- mod_fit$metadata()$iter_sampling
+
+# dimensions  [1200 iterations, 4 chains, 548 flattened parameters (548 = 274 obs by 2 latent factors)
+raw_z <- mod_fit$draws("z_expanded", format = "array")  # 500, 4, 548  (274 * 2 latent factors = 548)
+raw_lambda <- mod_fit$draws("lambda_raw", format = "array")
+
+# Establish a baseline template using a stable iteration 
+# example_z <- mod_fit$draws("z_expanded[1,1]", format = "array")
+# base_traceplot(example_z, "z_expanded[1,1]") # all respectable. Pick chain 1
+# Save example unaligned (and later aligned) z scores for plotting above.
+# examp_draws <- list(z11_unaligned = example_z, 
+#                     z12_unaligned = mod_fit$draws("z_expanded[1,2]", format = "array"))
+first_vector <- raw_z[500, 4, ]
+
+target_matrix <- matrix(NA, nrow = n_obs, ncol = n_latent)
+target_matrix[, 1] <- first_vector[1:n_obs]           # Elements 1 to 274 = Axis 1
+target_matrix[, 2] <- first_vector[(n_obs + 1):(n_obs*2)]    # Elements 275 to 548= Axis 2
+
+# Standardise the master frame
+target_matrix <- scale(target_matrix) 
+
+# Create empty, 4D arrays to store the aligned results
+# dim =iterations, chains, observations, latent axes
+z_unpacked_aligned <- array(NA, dim = c(n_iterations, n_chains, n_obs, n_latent))
+lambda_unpacked_aligned <- array(NA, dim = c(n_iterations, n_chains, n_taxa, n_latent))
+
+for (c in 1:n_chains) {
+  for (i in 1:n_iterations) {
+    # current 550-element vector
+    current_vector <- raw_z[i, c, ]
+    # Create an empty  275 x 2 matrix to be populated
+    current_matrix <- matrix(NA, nrow = n_obs, ncol = n_latent)
+    current_matrix[, 1] <- current_vector[1:n_obs]            # Dimension 1 (Axis 1)
+    current_matrix[, 2] <- current_vector[(n_obs + 1):(n_obs*2)]    # Dimension 2 (Axis 2)
+    # Standardise to remove cross-chain scale discrepancies
+    current_matrix_scaled <- scale(current_matrix)
+    if (any(is.na(current_matrix_scaled)) || any(is.infinite(current_matrix_scaled))) {
+      next 
+    }
+    # Rotate the iteration onto the master template: dimensions [274,2]
+    rotation <- vegan::procrustes(X = target_matrix, Y = current_matrix_scaled, symmetric = FALSE)
+    z_unpacked_aligned[i, c, , ] <- rotation$Yrot
+    # Extract the 2 x 2 rotation matrix calculated for this iteration for aligning the species loadings (lambda)
+    rotation_matrix <- rotation$rotation
+    current_lambda_vector <- raw_lambda[i, c, ]
+    current_lambda_matrix <- matrix(current_lambda_vector, nrow = n_taxa, ncol = n_latent)
+    # multiply lambda by the same rotation matrix
+    lambda_unpacked_aligned[i, c, , ] <- current_lambda_matrix %*% rotation_matrix
+  }
+}
+# Add to data for example plot above
+# examp_draws$z1_aligned <- z_unpacked_aligned[,,161,]
+# save(examp_draws, file = "~/uomShare/wergStaff/ChrisW/git-data/mw_metabarcoding_model/examp_draws.rda")
+
+####
+# 1. Recalculate draws for aligned Z (latent factor scores for sites)
+# z_expanded values are identical for observations from the same sites, so just use one value per site
+unique_site_ids <- 1:n_site
+first_obs_indices <- match(unique_site_ids, mod_data$site)
+all_sites_samples_raw <- z_unpacked_aligned[, , first_obs_indices, ] # dim [1200, 4, 223, 2]
+# Reshape from a 4-D array into a standard 3-D MCMC array: [1200, 4, 446]
+n_parameters <- n_site * n_latent
+all_sites_samples_flat <- array(all_sites_samples_raw, dim = c(n_iterations, n_chains, n_parameters))
+parameter_names <- character(n_parameters)
+idx <- 1
+for (s in unique_site_ids) {
+  parameter_names[idx]     <- paste0("Site_", s, "_Z1")
+  parameter_names[idx + 1] <- paste0("Site_", s, "_Z2")
+  idx <- idx + 2
+}# Apply the naming dimensions to the reshaped array
+dimnames(all_sites_samples_flat) <- list(
+  Iteration = 1:n_iterations,
+  Chain     = 1:n_chains,
+  Parameter = parameter_names
+)
+# The formal draws object 
+all_sites_aligned_draws <- as_draws_array(all_sites_samples_flat)
+
+# 2. Recalculate draws for aligned lambda (latent factor scores for species)
+n_lambda_params <- n_taxa * n_latent
+lambda_flat <- array(lambda_unpacked_aligned, dim = c(n_iterations, n_chains, n_lambda_params))
+species_names <- colnames(mod_data$y)
+lambda_names <- character(n_lambda_params)
+idx <- 1
+for (j in 1:n_taxa) {
+  lambda_names[idx]     <- paste0("Species_", species_names[j], "_Load_Axis1")
+  lambda_names[idx + 1] <- paste0("Species_", species_names[j], "_Load_Axis2")
+  idx <- idx + 2
+}
+dimnames(lambda_flat) <- list(
+  Iteration = 1:n_iterations,
+  Chain     = 1:n_chains,
+  Parameter = lambda_names
+)
+# Cast into a formal MCMC draws object
+lambda_aligned_draws <- as_draws_array(lambda_flat)  # dim [1200, 4, 1762] 1762 = 881 spp by 2 latent factors
+```
+
+From these aligned z and lambda draws, we revised the diagnostic summary for the model using the following code to produce @tbl_diags, which shows the model to be in good order. In my first re-run of the model (with tightened sigma_taxon prior and corrected data assembly), the lowest ESS was for one of the latent factor site values: not terribly low at 305. Because the non-latent factor variables were all well above 400 (@tbl-diags), this model is adequate for model comparisons.  
+
+The resulting effective sampling sizes suggest 500 iterations per draw would be plenty for future runs (or for thinning for use of the model later)
+
+```{r}
+#| label: "tbl-diags"
+#| echo: false
+
+lambda_diagnostic_summary <- summarise_draws(lambda_aligned_draws)
+z_diagnostic_summary <- summarise_draws(all_sites_aligned_draws)
+
+mod_summary <- mod_bundle$summary[-grep("z_exp|lambda",mod_bundle$summary$variable),]
+mod_summary <- rbind(mod_summary, lambda_diagnostic_summary,z_diagnostic_summary)
+mod_summary$variable[which(mod_summary$ess_bulk == min(mod_summary$ess_bulk, na.rm = TRUE))]
+diag_summary <- data.frame(spec = c("No. sampling iterations","No. divergences",
+                                    "No. max_treedepth exceedences",
+                                    "BFMI (Chain 1)","BFMI (Chain 2)","BFMI (Chain 3)","BFMI (Chain 4)",
+                                    "Min. Bulk ESS", "Min. Tail ESS","Max R-hat",
+                                    "Worst sampled parameter"),
+                           value = c(n_iterations,
+                                     sum(mod_bundle$diagnostics$num_divergent),
+                                     sum(mod_bundle$diagnostics$num_max_treedepth),
+                                     round(mod_bundle$diagnostics$ebfmi,2),
+                                     round(min(mod_summary$ess_bulk, na.rm = TRUE)),
+                                     round(min(mod_summary$ess_tail, na.rm = TRUE)),
+                                     round(max(mod_summary$rhat, na.rm = TRUE),2),
+                                     mod_summary$variable[which(mod_summary$ess_bulk == min(mod_summary$ess_bulk, na.rm = TRUE))])
+                           )
+
+if(grepl("Z|lambda", diag_summary$value[diag_summary$spec == "Worst sampled parameter"])){
+  non_latent <- mod_summary[-grep("Z|lambda", mod_summary$variable),]
+  w1 <- non_latent[order(non_latent$ess_bulk),][1,]
+  diag_summary <- rbind(diag_summary, data.frame(spec = c("Min. Bulk ESS (non-latent params)",
+                                                          "Worst non-latent param"),
+                                                 value = c(round(w1$ess_bulk), w1$variable)))
+}
+ft_to_word(flextable::flextable(diag_summary))
+
+```
+
+### Assessing the latent-factor ordination
+
+```{r}
+#| label: fig-latent_factor_ordination
+#| echo: false
+#| fig-width: 5
+#| fig-height: 5
+#| fig-cap: "Ordination of latent factors explaining random variation among sites (grey points), overlain by mean locations of species in the ordination space (red points)."
+
+# Plot latent site ordination
+mean_obs_z1 <- apply(z_unpacked_aligned[, , , 1], 3, mean, na.rm = TRUE)
+mean_obs_z2 <- apply(z_unpacked_aligned[, , , 2], 3, mean, na.rm = TRUE)
+ordination_df <- data.frame(Site = mod_data$site, 
+  Z1   = mean_obs_z1,
+  Z2   = mean_obs_z2
+)
+# Site scores are unique, so reduce to one value per site
+unique_site_ordination <- unique(ordination_df)
+plot(unique_site_ordination$Z1, unique_site_ordination$Z2,  pch = 21, bg = grey(0.8), 
+     xlab = "Latent Axis 1", 
+     ylab = "Latent Axis 2", asp = 1)
+abline(v = 0, h = 0, lty = 2)
+
+samples <- mod_bundle$sample_set
+sites <- unique(samples[c("reach_v12","site_no")])
+
+# Map species to the ordination - put z and lambda on the same scale first
+species <- mod_bundle$species_set
+mean_lambda1 <- apply(lambda_unpacked_aligned[, , , 1], 3, mean, na.rm = TRUE)
+mean_lambda2 <- apply(lambda_unpacked_aligned[, , , 2], 3, mean, na.rm = TRUE)
+max_site_range <- max(abs(c(unique_site_ordination$Z1, unique_site_ordination$Z2)))
+max_spp_range  <- max(abs(c(mean_lambda1, mean_lambda2)))
+# The scale factor adjusts species to occupy roughly 80% of the site space
+scale_factor <- (max_site_range / max_spp_range) * 0.8
+species_ord <- data.frame(species = species$taxon[match(colnames(mod_bundle$data$y),species$taxoncode)],
+                          taxoncode = colnames(mod_bundle$data$y),
+                          axis_1  = mean_lambda1 * scale_factor, 
+                          axis_2  = mean_lambda2 * scale_factor)
+points(species_ord$axis_1,species_ord$axis_2, pch = 16, cex = 0.5, col = "red")
+
+```
+
+*The following selection of points may not work without editing for future runs of the model, as the Procrustes rotation may well invert axes*
+Most sites are grouped tightly around the origin of the ordination indicating little structure among sites.  Five sites ("BNY_24764", "GIS_1106",  "LOL_11925", "PRW_13767", and "REI_3934") lie to the right of the main mass of sites, with "LOL_11925" the largest outlier in the top_left (@fig-latent_factor_ordination). These sites do not seem to have features in common.
+
+Appear to be primarily urban/disturbance tolerant species. This requires further thought.
+
+```{r}
+#| eval: false
+
+# # 5 sites with latent axis 1 scores > 2.5
+# # used to manually check them first
+# identify(unique_site_ordination$Z1, unique_site_ordination$Z2, unique_site_ordination$Site)
+low_z1s <-  unique_site_ordination[unique_site_ordination$Z2 < -2,]
+sites[sites$site_no %in% low_z1s$Site,]
+# "BNY_24764" "GIS_1106"  "LOL_11925" "PRW_13767" "REI_3934" (and least extreme SAS_190)
+set_preds <- data.frame(reach_v12 = NA, mod_bundle$pred_set[low_z1s$Site,])
+for(i in 1:nrow(low_z1s)){
+  set_preds$reach_v12[i] <- sites$reach_v12[sites$site_no == low_z1s$Site[i]]
+}
+
+# Species associated with those sites
+species_ord[species_ord$axis_1 < -2.5,] # A mix of moderately tolerant and sensitive species
+
+# Conduct broader tests for any residual geographical information
+coords <- sf::st_read(mwbugs, 
+                      query = paste0("SELECT reach_v12, geom FROM sites WHERE reach_v12 IN ('",
+                              paste(sites$reach_v12, collapse = "', '"), "');"))
+coords <- data.frame(reach_v12 = coords$reach_v12, sf::st_coordinates(coords))
+coords <- coords[match(sites$reach_v12,coords$reach_v12),]
+coords$site_no <- sites$site_no
+dist_matrix <- as.matrix(dist(coords[c("X","Y")]))
+# Invert the distance matrix to create a spatial weights matrix (closer = heavier weight)
+weights_matrix <- 1 / dist_matrix
+diag(weights_matrix) <- 0 
+weights_matrix[is.infinite(weights_matrix)] <- 0
+# Moran's I to assess for any potential contagious distribution
+moran_z1 <- ape::Moran.I(unique_site_ordination$Z1, weights_matrix) # p.value 0.057
+moran_z2 <- ape::Moran.I(unique_site_ordination$Z2, weights_matrix) # p.value 0.0003
+# This is suggestive of a contagious distribution, and spatial autocorrelation
+
+# Regressions predicting Axis 1 and 2 from spatial location
+Z <- cbind(unique_site_ordination, coords)
+spatial_lm1 <- lm(Z1 ~ X * Y, data = Z)
+spatial_lm2 <- lm(Z2 ~ X * Y, data = Z)
+summary(spatial_lm1)$r.squared  
+summary(spatial_lm2)$r.squared  
+# Both ~ 0.01, which suggests no residual trend across Euclidean space
+
+```
+
+
+```{r}
+#| label: fig-auc
+#| echo: false
+#| fig-width: 5
+#| fig-height: 8
+#| fig-cap: "A. ROC-AUC and B. PR-AUC for all 200 modelled species. Black points show AUC when probability of occurrence is modelled using latent-factor site variables. Red points are AUC calculated only using the fixed environmental predictors. C shows the two PR-AUC measures for the 39 species with low prevalence (below the gray horizontal line in A and B: present in <7 sites), with the two measures connected by a red horizontal line for clarity. The vertical line in A. shows the AUC score at which the model would be no better than chance.  The diagonal lines in B and C show the lowest possible PR-AUC value (equal to species prevalence)."
+
+# p_total_array_raw <- mod_fit$draws("p_total_out", format = "array")  # Needs > 120 Gb RAM
+# p_env_array_raw   <- mod_fit$draws("p_env_out",   format = "array")
+# mean_vector_total <- apply(p_total_array_raw, 3, mean)
+# mean_vector_env   <- apply(p_env_array_raw,   3, mean)
+# mean_p_total <- matrix(mean_vector_total, nrow = n_obs, ncol = n_taxa)
+# mean_p_env   <- matrix(mean_vector_env,   nrow = n_obs, ncol = n_taxa)
+# 
+# # Arrays to hold the final AUC metrics for all species
+# roc_auc_total <- numeric(n_taxa)
+# pr_auc_total  <- numeric(n_taxa)
+# roc_auc_env   <- numeric(n_taxa)
+# pr_auc_env    <- numeric(n_taxa)
+# # Calculate curve for each species
+# for(j in 1:n_taxa) {
+#   # Observed presence-absence
+#   obs_y <- mod_data$y[, j]
+#   # Separate probabilities for presences and absences
+#   pred_pres_total <- mean_p_total[obs_y == 1, j]
+#   pred_abs_total  <- mean_p_total[obs_y == 0, j]
+#   pred_pres_env   <- mean_p_env[obs_y == 1, j]
+#   pred_abs_env    <- mean_p_env[obs_y == 0, j]
+#   # Calculate the full-model curves (Environment + Latent factors)
+#   fg_t <- pred_pres_total
+#   bg_t <- pred_abs_total
+#   roc_auc_total[j] <- PRROC::roc.curve(scores.class0 = fg_t, scores.class1 = bg_t)$auc
+#   pr_auc_total[j]  <- PRROC::pr.curve(scores.class0 = fg_t, scores.class1 = bg_t)$auc.integral
+#   # Calculate the pure environmental curves (U matrix only)
+#   fg_e <- pred_pres_env; bg_e <- pred_abs_env
+#   roc_auc_env[j] <- PRROC::roc.curve(scores.class0 = fg_e, scores.class1 = bg_e)$auc
+#   pr_auc_env[j]  <- PRROC::pr.curve(scores.class0 = fg_e, scores.class1 = bg_e)$auc.integral
+# }
+# 
+# # Combine into a gorgeous evaluation summary dataframe!
+# auc_tab <- data.frame(
+#   species = species_set$taxon[match(colnames(mod_data$y), species_set$taxoncode)],
+#   taxoncode = colnames(mod_data$y),
+#   prevalence = species_set$prevalence[match(colnames(mod_data$y), species_set$taxoncode)],
+#   roc_auc_total = roc_auc_total,  pr_auc_total = pr_auc_total,
+#   roc_auc_env = roc_auc_env,  pr_auc_env = pr_auc_env)
+# save(auc_tab, file = "~/uomShare/wergStaff/ChrisW/temp/auc_tab_881spp_500.rda")
+load("~/uomShare/wergStaff/ChrisW/temp/auc_tab_881spp_500.rda")
+
+layout(matrix(c(1,2,3,4,4,4), c(2,3), byrow = TRUE), widths = c(2,12,12), heights = c(6,6))
+par(mar = c(0,0,0,0)); plot.new(); title(ylab = "Prevalence by site (%)", line = -2)
+
+par(mar = c(4,2,1,1))
+auc_tab <- auc_tab[order(auc_tab$prevalence, decreasing = TRUE),]
+with(auc_tab, plot(roc_auc_total, sqrt(prevalence), xlim = c(0.5,1), xlab = "ROC-AUC", axes = FALSE))
+with(auc_tab, points(roc_auc_env, sqrt(prevalence), col = "red"))
+abline(h = sqrt(2.5/223), lty = 1, col = "gray");
+abline(v = 0.5, lty = 3); title(main = "A.", adj = 0)
+axis(1); axis(2, las = 1, at = sqrt(c(0.02,0.05,seq(0,0.8,0.1))), labels = c(2,5,seq(0,80,10))); box(bty = "l")
+
+with(auc_tab, plot(pr_auc_total, sqrt(prevalence), xlim = c(min(prevalence),1), xlab = "PR-AUC", axes = FALSE))
+with(auc_tab, points(pr_auc_env, sqrt(prevalence), col = "red"))
+with(auc_tab, lines(prevalence, sqrt(prevalence), lty = 3)); title(main = "B.", adj = 0)
+legend("topleft", pch = 1, col = c("black","red"), legend = c("Full model","Environmental predictors only"), cex = 0.9)
+axis(1); axis(2, las = 1, at = sqrt(c(0.02,0.05,seq(0,0.8,0.1))), labels = c(2,5,seq(0,80,10))); box(bty = "l"); 
+abline(h = sqrt(2.5/223), lty = 1, col = "gray");
+
+low_prev_species <- auc_tab[auc_tab$prevalence <= 2.5/223,]
+par(mar = c(4,12,1,1))
+low_prev_species$index <- nrow(low_prev_species):1
+with(low_prev_species, plot(pr_auc_total, index, xlim = c(0,1), 
+                            axes = FALSE, xlab = "PR-AUC", ylab = ""))
+with(low_prev_species, points(pr_auc_env, index, col = "red"))
+for(i in 1:nrow(low_prev_species)){
+  lines(c(low_prev_species$pr_auc_total[i],low_prev_species$pr_auc_env[i]),rep(low_prev_species$index[i],2), col = "red")
+}
+lines(low_prev_species$prevalence, low_prev_species$index, type = "s", lty = 3); title(main = "C.", adj = 0)
+axis(1); axis(2, at = 1:nrow(low_prev_species), 
+              labels = rev(low_prev_species$species), las = 1, cex.axis= 0.75); box(bty = "l")
+```
+
+#### Observed vs Predicted species richness
+
+Predicted species richness per sample of the 200 species in the model was well predicted by the model (@fig-exp_richness - thank you, Tom - your tightening of the sigma_taxon prior did the trick!). Sample 384-UYT-199-4-DP is the one extreme low outlier with many more species observed than predicted.  This is an odd result, given the other 4 samples taken from this site were well predicted (the other samples from this site had observed, and predicted richness between 36 and 48).  This has me suspecting a data mix-up....I will look into that possibility some more.
+
+There are 4 or 5 other samples for which the 95% CLs do not cross the 1:1 line. I will postpone investigating these further until the model predictors are nailed down.
+
+```{r}
+#| label: fig-exp_richness
+#| echo: false
+#| fig-width: 5
+#| fig-height: 5
+#| fig-cap: "Mean predicted species richness per sample with 95% confidence limits against observed richness.  The dotted line is 1:1."
+
+# # Extract simulated data
+# y_rep_array <- y_rep_matrix <- mod_fit$draws("y_rep", format = "matrix") # needs >130Gb RAM
+# y_rep_matrix <- as.matrix(y_rep_matrix)
+# # 2. Rebuild the 3D array: n draws, n species, n samples
+# # R fills arrays column-first, which perfectly matches how Stan flattens arrays:
+# # y_rep[1,1], y_rep[2,1], ..., y_rep[33,1], y_rep[1,2]...
+# y_rep_array <- array(y_rep_matrix, dim = c(n_chains * n_iterations, n_obs, n_taxa))
+# expected_richness_draws <- apply(y_rep_array, c(1, 2), sum) # dimensions: n_draws by n_obs
+# 
+# # Compute statistics column-wise for the 275 samples
+# richness_summary <- data.frame(
+#   smpcode = row.names(mod_data$y),
+#   sample_id     = 1:274,
+#   obs_richness = apply(mod_data$y, 1, FUN = sum),
+#   mean_richness = colMeans(expected_richness_draws),
+#   ci_lower      = apply(expected_richness_draws, 2, quantile, probs = 0.025),
+#   ci_upper      = apply(expected_richness_draws, 2, quantile, probs = 0.975),
+#   row.names     = NULL
+# )
+# save(richness_summary, file = "~/uomShare/wergStaff/ChrisW/temp/exp_richness_881spp_500.rda")
+load("~/uomShare/wergStaff/ChrisW/temp/exp_richness_881spp_500.rda")
+
+par(mfrow = c(1,1), mar = c(4,4,1,1))
+plot(richness_summary$obs_richness, richness_summary$mean_richness, 
+     ylim = c(0,210), xlim = c(0,210), xlab = "Observed richness",
+     ylab = "Predicted richness", axes = FALSE)
+abline = c(0,1)
+for(i in 1:nrow(richness_summary)){
+  lines(rep(richness_summary$obs_richness[i],2),
+    c(richness_summary$ci_lower[i], richness_summary$ci_upper[i]))
+}
+abline(0,1,lty = 1); axis(1); axis(2, las = 1); box(bty = "l")
+abline(lm(mean_richness ~ obs_richness, data = richness_summary), lty = 3)
+# identify(richness_summary$obs_richness,richness_summary$mean_richness, richness_summary$smpcode)
+
+# # Alternative approach using predicted 0s and 1s
+# simulated_presence <- array(
+#   rbinom(length(y_rep_array), size = 1, prob = y_rep_array),
+#   dim = dim(y_rep_array)
+# )
+# 
+# # Sum presence/absence over species (dimension 2)
+# sim_richness_draws <- apply(simulated_presence, c(1, 2), sum)
+# 
+# # Compute statistics
+# sim_richness_summary <- data.frame(
+#   sample_id     = 1:274,
+#   obs_richness = apply(mod_data$y, 1, FUN = sum),
+#   mean_richness = colMeans(sim_richness_draws),
+#   ci_lower      = apply(sim_richness_draws, 2, quantile, probs = 0.025),
+#   ci_upper      = apply(sim_richness_draws, 2, quantile, probs = 0.975),
+#   row.names     = NULL
+# )
+# 
+# plot(sim_richness_summary$obs_richness, sim_richness_summary$mean_richness,
+#      ylim = range(c(sim_richness_summary$ci_upper, sim_richness_summary$ci_lower)))
+# abline = c(0,1)
+# for(i in 1:nrow(sim_richness_summary)){
+#   lines(rep(sim_richness_summary$obs_richness[i],2),
+#     c(sim_richness_summary$ci_lower[i], sim_richness_summary$ci_upper[i]))
+# }
+# abline(0,1,lty = 3)
+# abline(lm(mean_richness ~ obs_richness, data = richness_summary), lty = 3)
+# # # Extract the numeric index from the string (e.g., "3" from "y_rep[1,3]") and sort
+# sample_numbers <- as.numeric(gsub(".*,([0-9]+)\\]", "\\1", richness_summary$sample_name))
+# richness_summary <- richness_summary[order(sample_numbers), ]
+# 
+```
+
+# Phylogenetic covariance
+
+The OU model is the preferable model because it sampled more efficiently, and OU has a stronger theoretical basis of OU over Brownian [@sharma_etal_2025].  Mean $\alpha_{phylo}$ was 6.8 (95% confidence intervals 5.5,8.4).  From this, and the correlation values between species from the phylogenetic covariance matrix $\mathbf{\Sigma}_{\text{phylo}}$, we can find the predicted correlation between species sharing different taxonomic ranks (@fig-corr_by_rank).  
+
+This suggests only a moderate correlation between species sharing the same genus or tribe, with little correlation between species sharing subfamilies or families, and near-zero correlation between species sharing orders. This suggests substantial evolutionary drift in niches within families suggesting substantial noise in models based on family-level taxonomy.
+
+It remains possible that these correlation values will change when the model is applied to the full 883 species in the dataset.
+
+```{r}
+#| label: "fig-corr_by_rank"
+#| fig-width: 6
+#| fig-height: 5
+#| fig-cap: "Predicted mean correlation (points) between species sharing a common taxonomic rank, with 80%  and 95% confidence limits (thick lines and think lines respectively"
+
+# spp_vcv_ou <- mod_data$phylo_cor
+# # # Congenerics (e.g Oecetis)  corr = 0.9114853
+# # spp_vcv_ou[grep("Oecetis", row.names(spp_vcv_ou)), grep("Oecetis", colnames(spp_vcv_ou))]
+# # # Same tribe corr (e.g Chironomini)= 0.8870648
+# # spp_vcv_ou[grep("Chironomus|Polypedilum", row.names(spp_vcv_ou)), grep("Chironomus|Polypedilum", colnames(spp_vcv_ou))]
+# # # Same subfamily (e.g. Chiornominae) corr = 0.8157158
+# # spp_vcv_ou[grep("Conochironomus|Polypedilum", row.names(spp_vcv_ou)), grep("Conochironomus|Polypedilum", colnames(spp_vcv_ou))]
+# # # Confamilials e.g Tateidae, Hydropsychidae corr =  0.7521885
+# # spp_vcv_ou[grep("pyrgus", row.names(spp_vcv_ou)), grep("pyrgus", colnames(spp_vcv_ou))]
+# # spp_vcv_ou[grep("Cheumatopsyche|Asmicridea", row.names(spp_vcv_ou)), grep("Cheumatopsyche|Asmicridea", colnames(spp_vcv_ou))]
+# # # Same order e.g Plecoptera = 0.5720539
+# # spp_vcv_ou[grep("Dinotoperla|Cosmioperla", row.names(spp_vcv_ou)), grep("Dinotoperla|Cosmioperla", colnames(spp_vcv_ou))]
+# # # Interpret the alpha_phylo value
+# 
+# alpha_draws <- mod_fit$draws(variables = "alpha_phylo")
+# # mean(alpha_draws) # 6.8
+# # quantile(alpha_draws, probs = c(0.025,0.975)) # 5.4 8.5
+# 
+# corrs_by_rank <- data.frame(common_rank = c("genus","tribe","subfamily","family","order"),
+#                             phylo_cor = c(0.9114853,0.8870648,0.8157158,0.7521885,0.5720539),
+#                             mean = NA, cl_025 = NA, cl_100 = NA, cl_900 = NA, cl_975 = NA)
+# for(i in 1:nrow(corrs_by_rank)){
+#   corri <- exp(-2 * alpha_draws * (1- corrs_by_rank$phylo_cor[i]))
+#   corrs_by_rank$mean[i] <- mean(corri)
+#   corrs_by_rank[i,4:7] <- quantile(corri, probs = c(0.025, 0.1, 0.9, 0.975))
+# }
+# save(corrs_by_rank, file = "~/uomShare/wergStaff/ChrisW/temp/corrs_by_rank_881spp_500.rda")
+load("~/uomShare/wergStaff/ChrisW/temp/corrs_by_rank_881spp_500.rda")
+
+plot(1:5, corrs_by_rank$mean, ylim = c(0,0.35), xlim = c(0.5,5.5), 
+     axes = FALSE, xlab = "Common taxonomic rank", 
+     ylab = "Correlation between related species") 
+for(i in 1:nrow(corrs_by_rank)){
+  lines(c(i,i),c(corrs_by_rank$cl_025[i], corrs_by_rank$cl_975[i]))
+  lines(c(i,i),c(corrs_by_rank$cl_100[i], corrs_by_rank$cl_900[i]), lwd = 3)
+}
+points(1:5, corrs_by_rank$mean, pch = 21, bg = "grey", cex = 1.25)
+axis(1, at = 1:5, labels = corrs_by_rank$common_rank); axis(2, las = 1); box(bty = 'l')
+abline(h = 0, lty = 3)
+
+```
+
+

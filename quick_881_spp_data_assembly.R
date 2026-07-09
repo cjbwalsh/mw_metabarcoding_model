@@ -289,8 +289,8 @@ run_881spp_model <- function(pred_site, mod_code, mod_path = "stancode/jointspp_
                           output_dir = mod_dir,
                           chains = 4, 
                           parallel_chains = 4,
-                          iter_warmup = 800,  
-                          iter_sampling = 1200)
+                          iter_warmup = 500,  
+                          iter_sampling = 500)
   mod_bundle$fit <- model_fit
   mod_bundle$diagnostics <- model_fit$diagnostic_summary()
   saveRDS(mod_bundle, file = paste0(mod_dir, "/", mod_code, "model_bundle.rds"))
